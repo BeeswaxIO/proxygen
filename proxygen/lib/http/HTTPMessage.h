@@ -61,8 +61,13 @@ class HTTPMessage {
    */
   void setClientAddress(const folly::SocketAddress& addr) {
     request().clientAddress_ = addr;
-    request().clientIP_ = addr.getAddressStr();
-    request().clientPort_ = folly::to<std::string>(addr.getPort());
+    if (addr.getFamily() != AF_UNIX) {
+      request().clientIP_ = addr.getAddressStr();
+      request().clientPort_ = folly::to<std::string>(addr.getPort());
+    } else {
+      request().clientIP_ = addr.getPath();
+      request().clientPort_ = "0";
+    }
   }
 
   const folly::SocketAddress& getClientAddress() const {
@@ -82,8 +87,14 @@ class HTTPMessage {
    */
   void setDstAddress(const folly::SocketAddress& addr) {
     dstAddress_ = addr;
-    dstIP_ = addr.getAddressStr();
-    dstPort_ = folly::to<std::string>(addr.getPort());
+    if (addr.getFamily() != AF_UNIX) {
+      dstIP_ = addr.getAddressStr();
+      dstPort_ = folly::to<std::string>(addr.getPort());
+    } else {
+      dstIP_ = addr.getPath();
+      dstPort_ = "0";
+    }
+
   }
 
   const folly::SocketAddress& getDstAddress() const {
