@@ -138,6 +138,7 @@ HTTPSession::HTTPSession(
     infoCallback_(infoCallback),
     writeTimeout_(this),
     flowControlTimeout_(this),
+    drainTimeout_(this),
     timeout_(timeout),
     transportInfo_(tinfo),
     reads_(SocketState::PAUSED),
@@ -317,7 +318,9 @@ HTTPSession::readTimeoutExpired() noexcept {
   VLOG(4) << *this << " Timeout with nothing pending";
 
   setCloseReason(ConnectionCloseReason::TIMEOUT);
-  shutdownTransport(true, true);
+  notifyPendingShutdown();
+  timeout_.scheduleTimeout(&drainTimeout_,
+                           controller_->getGracefulShutdownTimeout());
 }
 
 void
@@ -955,8 +958,10 @@ void HTTPSession::onAbort(HTTPCodec::StreamID streamID,
   if (isDownstream() && txn->getAssocTxnId() == 0 &&
       code == ErrorCode::CANCEL) {
     // Cancelling the assoc txn cancels all push txns
-    for (auto pushTxnId : txn->getPushedTransactions()) {
-      auto pushTxn = findTransaction(pushTxnId);
+    for (auto it = txn->getPushedTransactions().begin();
+         it != txn->getPushedTransactions().end(); ) {
+      auto pushTxn = findTransaction(*it);
+      ++it;
       DCHECK(pushTxn != nullptr);
       pushTxn->onError(ex);
     }
@@ -1245,7 +1250,7 @@ void HTTPSession::sendHeaders(HTTPTransaction* txn,
     goawayBuf = writeBuf_.move();
     writeBuf_.append(std::move(writeBuf));
   }
-  if (isUpstream() || (txn->isPushed() && headers.isResponse())) {
+  if (isUpstream() || (txn->isPushed() && headers.isRequest())) {
     // upstream picks priority
     auto pri = getMessagePriority(&headers);
     txn->onPriorityUpdate(pri);
@@ -1263,7 +1268,7 @@ void HTTPSession::sendHeaders(HTTPTransaction* txn,
   const uint64_t newOffset = sessionByteOffset();
 
   // only do it for downstream now to bypass handling upstream reuse cases
-  if (isDownstream() &&
+  if (isDownstream() && headers.isResponse() &&
       newOffset > oldOffset &&
       // catch 100-ish response?
       !txn->testAndSetFirstHeaderByteSent() && byteEventTracker_) {
@@ -2039,6 +2044,10 @@ HTTPSession::checkForShutdown() {
       !isLoopCallbackScheduled()) {
     VLOG(4) << "destroying " << *this;
     sock_->setReadCB(nullptr);
+    auto asyncSocket = sock_->getUnderlyingTransport<folly::AsyncSocket>();
+    if (asyncSocket) {
+      asyncSocket->setBufferCallback(nullptr);
+    }
     reads_ = SocketState::SHUTDOWN;
     if (resetSocketOnShutdown_) {
       sock_->closeWithReset();

@@ -50,6 +50,8 @@ class HTTPDownstreamTest : public testing::Test {
       transport_(new TestAsyncTransport(&eventBase_)),
       transactionTimeouts_(makeTimeoutSet(&eventBase_)),
       flowControl_(flowControl) {
+    EXPECT_CALL(mockController_, getGracefulShutdownTimeout())
+      .WillRepeatedly(Return(std::chrono::milliseconds(0)));
     EXPECT_CALL(mockController_, attachSession(_));
     HTTPSession::setDefaultReadBufferLimit(65536);
     httpSession_ = new HTTPDownstreamSession(
@@ -329,12 +331,12 @@ class HTTPDownstreamTest : public testing::Test {
            (!writeEvents->empty() || !parseOutputStream_.empty())) {
       if (!writeEvents->empty()) {
         auto event = writeEvents->front();
-        writeEvents->pop_front();
         auto vec = event->getIoVec();
         for (size_t i = 0; i < event->getCount(); i++) {
           parseOutputStream_.append(
             IOBuf::copyBuffer(vec[i].iov_base, vec[i].iov_len));
         }
+        writeEvents->pop_front();
       }
       uint32_t consumed = clientCodec.onIngress(*parseOutputStream_.front());
       parseOutputStream_.split(consumed);
@@ -2050,6 +2052,39 @@ TEST_F(HTTP2DownstreamSessionTest, padding_flow_control) {
   expectDetachSession();
 }
 
+TEST_F(HTTP2DownstreamSessionTest, graceful_drain_on_timeout) {
+  InSequence handlerSequence;
+  std::chrono::milliseconds gracefulTimeout(200);
+  getCodec().enableDoubleGoawayDrain();
+  EXPECT_CALL(mockController_, getGracefulShutdownTimeout())
+    .WillOnce(InvokeWithoutArgs([&] {
+          // Once session asks for graceful shutdown timeout, expect the client
+          // to receive the first GOAWAY
+          eventBase_.runInLoop([&] {
+              EXPECT_CALL(callbacks_,
+                          onGoaway(std::numeric_limits<int32_t>::max(),
+                                   ErrorCode::NO_ERROR, _));
+              parseOutput(*clientCodec_);
+            });
+          return gracefulTimeout;
+        }));
+
+
+  // Simulate ConnectionManager idle timeout
+  eventBase_.runAfterDelay([&] { httpSession_->timeoutExpired(); },
+                           transactionTimeouts_->getDefaultTimeout().count());
+  HTTPSession::DestructorGuard g(httpSession_);
+  auto start = getCurrentTime();
+  eventBase_.loop();
+  auto finish = getCurrentTime();
+  auto minDuration =
+    gracefulTimeout + transactionTimeouts_->getDefaultTimeout();
+  EXPECT_GE((finish - start).count(), minDuration.count());
+  EXPECT_CALL(callbacks_, onGoaway(0, ErrorCode::NO_ERROR, _));
+  parseOutput(*clientCodec_);
+  expectDetachSession();
+}
+
 /*
  * The sequence of streams are generated in the following order:
  * - [client --> server] request 1st stream (getGetRequest())
@@ -2116,6 +2151,65 @@ TEST_F(HTTP2DownstreamSessionTest, server_push) {
   clientCodec.generateRstStream(output, assocStreamId, ErrorCode::CANCEL);
   clientCodec.generateGoaway(output, 0, ErrorCode::NO_ERROR);
   transport_->addReadEvent(output, milliseconds(200));
+  transport_->startReadEvents();
+  HTTPSession::DestructorGuard g(httpSession_);
+  eventBase_.loop();
+
+  clientCodec.setCallback(&callbacks_);
+  parseOutput(clientCodec);
+  expectDetachSession();
+}
+
+TEST_F(HTTP2DownstreamSessionTest, server_push_abort_paused) {
+  HTTP2Codec serverCodec(TransportDirection::DOWNSTREAM);
+  HTTP2Codec clientCodec(TransportDirection::UPSTREAM);
+  IOBufQueue output{IOBufQueue::cacheChainLength()};
+  IOBufQueue input{IOBufQueue::cacheChainLength()};
+
+  // Create a dummy request and a dummy response messages
+  HTTPMessage req, res;
+  req.getHeaders().set("HOST", "www.foo.com");
+  req.setURL("https://www.foo.com/");
+  res.setStatusCode(200);
+  res.setStatusMessage("Ohai");
+
+  // Construct data sent from client to server
+  auto assocStreamId = HTTPCodec::StreamID(1);
+  clientCodec.getEgressSettings()->setSetting(SettingsId::ENABLE_PUSH, 1);
+  clientCodec.generateConnectionPreface(output);
+  clientCodec.generateSettings(output);
+  // generateHeader() will create a session and a transaction
+  clientCodec.generateHeader(output, assocStreamId, getGetRequest(),
+                             0, false, nullptr);
+
+  auto handler = addSimpleStrictHandler();
+  StrictMock<MockHTTPPushHandler> pushHandler;
+
+  InSequence handlerSequence;
+  handler->expectHeaders([&] {
+      // Generate response for the associated stream
+      this->transport_->pauseWrites();
+      handler->txn_->sendHeaders(res);
+      handler->txn_->sendBody(makeBuf(100));
+      handler->txn_->pauseIngress();
+
+      auto* pushTxn = handler->txn_->newPushedTransaction(&pushHandler);
+      ASSERT_NE(pushTxn, nullptr);
+      // Generate a push request (PUSH_PROMISE)
+      pushTxn->sendHeaders(req);
+    });
+  EXPECT_CALL(pushHandler, setTransaction(_))
+    .WillOnce(Invoke([&] (HTTPTransaction* txn) {
+          pushHandler.txn_ = txn; }));
+  EXPECT_CALL(pushHandler, onError(_));
+  EXPECT_CALL(pushHandler, detachTransaction());
+  handler->expectError();
+  handler->expectDetachTransaction();
+
+  transport_->addReadEvent(output, milliseconds(0));
+  // Cancels everything
+  clientCodec.generateRstStream(output, assocStreamId, ErrorCode::CANCEL);
+  transport_->addReadEvent(output, milliseconds(10));
   transport_->startReadEvents();
   HTTPSession::DestructorGuard g(httpSession_);
   eventBase_.loop();

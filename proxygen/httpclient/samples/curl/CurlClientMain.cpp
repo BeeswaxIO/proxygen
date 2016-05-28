@@ -86,18 +86,18 @@ int main(int argc, char* argv[]) {
 
   CurlClient curlClient(&evb, httpMethod, url, headers,
                         FLAGS_input_filename);
+  curlClient.setFlowControlSettings(FLAGS_recv_window);
 
   SocketAddress addr(url.getHost(), url.getPort(), true);
   LOG(INFO) << "Trying to connect to " << addr;
 
   // Note: HHWheelTimer is a large object and should be created at most
   // once per thread
-  HHWheelTimer::UniquePtr timer{
-    new HHWheelTimer(
-        &evb,
-        std::chrono::milliseconds(HHWheelTimer::DEFAULT_TICK_INTERVAL),
-        AsyncTimeout::InternalEnum::NORMAL,
-        std::chrono::milliseconds(5000))};
+  HHWheelTimer::UniquePtr timer{HHWheelTimer::newTimer(
+      &evb,
+      std::chrono::milliseconds(HHWheelTimer::DEFAULT_TICK_INTERVAL),
+      AsyncTimeout::InternalEnum::NORMAL,
+      std::chrono::milliseconds(5000))};
   HTTPConnector connector(&curlClient, timer.get());
   if (!FLAGS_plaintext_proto.empty()) {
     connector.setPlaintextProtocol(FLAGS_plaintext_proto);
