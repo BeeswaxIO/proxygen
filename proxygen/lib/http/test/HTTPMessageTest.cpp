@@ -7,21 +7,19 @@
  *  of patent rights can be found in the PATENTS file in the same directory.
  *
  */
-#include <arpa/inet.h>
 #include <fcntl.h>
 #include <gtest/gtest.h>
-#include <libgen.h>
 #include <list>
-#include <netdb.h>
-#include <netinet/in.h>
 #include <proxygen/lib/http/HTTPMessage.h>
 #include <proxygen/lib/utils/TestUtils.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
 #include <sys/types.h>
-#include <unistd.h>
+
+#include <folly/portability/Libgen.h>
+#include <folly/portability/Sockets.h>
+#include <folly/portability/Unistd.h>
 
 using namespace proxygen;
 using namespace std;

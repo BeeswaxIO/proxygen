@@ -19,6 +19,7 @@ using namespace testing;
 using folly::AsyncSocket;
 using folly::test::MockAsyncSocket;
 using folly::SocketAddress;
+using wangle::SecureTransportType;
 
 namespace {
 
@@ -55,7 +56,12 @@ class HTTPTargetSessionAcceptor : public HTTPSessionAcceptor {
                                          tinfo);
   }
 
+  void onSessionCreationError(ProxygenError error) override {
+    sessionCreationErrors_++;
+  }
+
   uint32_t sessionsCreated_{0};
+  uint32_t sessionCreationErrors_{0};
   std::string expectedProto_;
 };
 
@@ -125,6 +131,7 @@ TEST_P(HTTPSessionAcceptorTestNPN, npn) {
       SecureTransportType::TLS,
       tinfo);
   EXPECT_EQ(acceptor_->sessionsCreated_, 1);
+  EXPECT_EQ(acceptor_->sessionCreationErrors_, 0);
 }
 
 char const* protos1[] = { "h2-14", "h2", "spdy/3.1", "spdy/3",
@@ -153,6 +160,7 @@ TEST_P(HTTPSessionAcceptorTestNPNPlaintext, plaintext_protocols) {
       SecureTransportType::TLS,
       tinfo);
   EXPECT_EQ(acceptor_->sessionsCreated_, 1);
+  EXPECT_EQ(acceptor_->sessionCreationErrors_, 0);
 }
 
 char const* protos2[] = { "spdy/3", "h2c" };
@@ -174,4 +182,5 @@ TEST_F(HTTPSessionAcceptorTestNPNJunk, npn) {
       SecureTransportType::TLS,
       tinfo);
   EXPECT_EQ(acceptor_->sessionsCreated_, 0);
+  EXPECT_EQ(acceptor_->sessionCreationErrors_, 1);
 }

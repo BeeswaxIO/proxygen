@@ -136,10 +136,21 @@ class HTTPSession:
 
   void setInfoCallback(InfoCallback* callback);
 
+  InfoCallback* getInfoCallback() const {
+    return infoCallback_;
+  }
+
   void setSessionStats(HTTPSessionStats* stats);
 
   folly::AsyncTransportWrapper* getTransport() {
     return sock_.get();
+  }
+
+  folly::EventBase* getEventBase() const {
+    if (sock_) {
+      return sock_->getEventBase();
+    }
+    return nullptr;
   }
 
   /**
@@ -169,6 +180,10 @@ class HTTPSession:
 
   uint32_t getNumOutgoingStreams() const {
     return outgoingStreams_;
+  }
+
+  size_t getNumTransactions() const {
+    return transactions_.size();
   }
 
   uint32_t getHistoricalMaxOutgoingStreams() const {
@@ -672,7 +687,7 @@ class HTTPSession:
     return sock_->getSecurityProtocol();
   }
 
-  void setByteEventTracker(std::unique_ptr<ByteEventTracker> byteEventTracker);
+  void setByteEventTracker(std::shared_ptr<ByteEventTracker> byteEventTracker);
   ByteEventTracker* getByteEventTracker() { return byteEventTracker_.get(); }
 
   /**
@@ -838,6 +853,9 @@ class HTTPSession:
   bool shouldShutdown() const;
 
   void drainImpl();
+
+  void pauseReadsImpl();
+  void resumeReadsImpl();
 
   /** Chain of ingress IOBufs */
   folly::IOBufQueue readBuf_{folly::IOBufQueue::cacheChainLength()};
@@ -1110,8 +1128,8 @@ class HTTPSession:
       size_t encodedSize,
       bool piggybacked) noexcept;
 
-  std::unique_ptr<ByteEventTracker> byteEventTracker_{
-    folly::make_unique<ByteEventTracker>(this)};
+  std::shared_ptr<ByteEventTracker> byteEventTracker_{
+    std::make_shared<ByteEventTracker>(this)};
 
   /**
    * Add a ReplaySafetyCallback requesting notification when the transport has

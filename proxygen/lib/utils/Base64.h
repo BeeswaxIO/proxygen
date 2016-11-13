@@ -9,8 +9,18 @@
  */
 #pragma once
 
-#include <wangle/ssl/SSLContextConfig.h>
+#include <string>
+#include <folly/Range.h>
 
 namespace proxygen {
-  typedef wangle::SSLContextConfig SSLContextConfig;
+
+// This is a wrapper around openssl base64 encoding.  It is a temporary wrapper
+// around openssl, until a more optimized version lands in folly
+
+class Base64 {
+  public:
+    static std::string decode(const std::string& b64message);
+    static std::string encode(folly::ByteRange buffer);
+};
+
 }

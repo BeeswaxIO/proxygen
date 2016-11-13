@@ -15,6 +15,7 @@
 #include <proxygen/httpserver/SignalHandler.h>
 #include <proxygen/httpserver/filters/RejectConnectFilter.h>
 #include <proxygen/httpserver/filters/ZlibServerFilter.h>
+#include <wangle/ssl/SSLContextManager.h>
 
 using folly::AsyncServerSocket;
 using folly::EventBase;
@@ -121,14 +122,24 @@ void HTTPServer::start(std::function<void()> onSuccess,
   try {
     FOR_EACH_RANGE (i, 0, addresses_.size()) {
       auto codecFactory = addresses_[i].codecFactory;
+      auto accConfig = HTTPServerAcceptor::makeConfig(addresses_[i], *options_);
       auto factory = std::make_shared<AcceptorFactory>(
         options_,
         codecFactory,
-        HTTPServerAcceptor::makeConfig(addresses_[i], *options_),
+        accConfig,
         sessionInfoCb_);
       bootstrap_.push_back(
           wangle::ServerBootstrap<wangle::DefaultPipeline>());
       bootstrap_[i].childHandler(factory);
+      if (accConfig.enableTCPFastOpen) {
+        // We need to do this because wangle's bootstrap has 2 acceptor configs
+        // and the socketConfig gets passed to the SocketFactory. The number of
+        // configs should really be one, and when that happens, we can remove
+        // this code path.
+        bootstrap_[i].socketConfig.enableTCPFastOpen = true;
+        bootstrap_[i].socketConfig.fastOpenQueueSize =
+            accConfig.fastOpenQueueSize;
+      }
       bootstrap_[i].group(accExe, exe);
       bootstrap_[i].bind(addresses_[i].address);
     }
@@ -156,12 +167,15 @@ void HTTPServer::start(std::function<void()> onSuccess,
   mainEventBase_->loopForever();
 }
 
-void HTTPServer::stop() {
+void HTTPServer::stopListening() {
   CHECK(mainEventBase_);
-
   for (auto& bootstrap : bootstrap_) {
     bootstrap.stop();
   }
+}
+
+void HTTPServer::stop() {
+  stopListening();
 
   for (auto& bootstrap : bootstrap_) {
     bootstrap.join();
@@ -184,6 +198,48 @@ const std::vector<const folly::AsyncSocketBase*>
   }
 
   return sockets;
+}
+
+int HTTPServer::getListenSocket() const {
+  if (bootstrap_.size() == 0) {
+    return -1;
+  }
+
+  auto& bootstrapSockets = bootstrap_[0].getSockets();
+  if (bootstrapSockets.size() == 0) {
+    return -1;
+  }
+
+  auto serverSocket =
+      std::dynamic_pointer_cast<folly::AsyncServerSocket>(bootstrapSockets[0]);
+  auto socketFds = serverSocket->getSockets();
+  if (socketFds.size() == 0) {
+    return -1;
+  }
+
+  return socketFds[0];
+}
+
+void HTTPServer::updateTicketSeeds(wangle::TLSTicketKeySeeds seeds) {
+  for (auto& bootstrap : bootstrap_) {
+    bootstrap.forEachWorker([&](wangle::Acceptor* acceptor) {
+      if (!acceptor) {
+        return;
+      }
+      auto evb = acceptor->getEventBase();
+      if (!evb) {
+        return;
+      }
+      evb->runInEventBaseThread([acceptor, seeds] {
+        auto ctxMgr = acceptor->getSSLContextManager();
+        if (!ctxMgr) {
+          return;
+        }
+        ctxMgr->reloadTLSTicketKeys(
+            seeds.oldSeeds, seeds.currentSeeds, seeds.newSeeds);
+      });
+    });
+  }
 }
 
 }

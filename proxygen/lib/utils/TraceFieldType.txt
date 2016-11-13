@@ -51,6 +51,7 @@ LastBodyByteFlushed, "last_body_byte_flushed"
 LastBodyByteFlushedRatio, "last_body_byte_flushed_ratio"
 HeaderGenerated, "header_generated"
 FlowControlPauses, "flow_control_pauses"
+HTTPMethod, "http_method"
 
 /* ---- Used in ResponseBodyRead ---- */
 RspIntvlAvg, "response_interval_average"
@@ -59,6 +60,10 @@ RspNumOnBody, "response_number_on_body"
 ServerQuality, "response_server_quality"
 ServerRtt, "server_rtt"
 RecvToAck, "flow_control_recv_to_ack"
+ServerRtx, "server_rtx"
+ServerCwnd, "server_cwnd"
+ServerMss, "server_mss"
+ServerTotalBytesWritten, "server_tbw"
 
 /* ---- Used in PreConnect ---- */
 NewConnection, "new_connection"
@@ -81,6 +86,7 @@ MaxConnectionRetryCount, "max_connection_retry_count"
 MaxIdleHTTPSessions, "max_idle_http_sessions"
 MaxIdleSPDYSessions, "max_idle_spdy_sessions"
 ConnRoutingStale, "connection_routing_stale"
+AltSvcHost, "alt_svc_host"
 
 /* ---- Used in TcpConnect ---- */
 ServerAddr, "server_address"
@@ -120,6 +126,9 @@ TLSVersion, "ssl_version"
 OpenSSLVersion, "openssl_version"
 TLSCachePersistence, "tls_cache_persistence"
 
+/* ----- Used in TLSCachedInfo ---- */
+TLSCachedInfoHit, "tls_cached_info_cert_cache_hit"
+
 /* ---- Used in Decompression ---- */
 RspBodySize, "response_body_size"
 RspBodyCompSize, "response_body_compressed_size"
@@ -138,7 +147,23 @@ VerifiedMatchedCommonName, "verified_matchedCommonName"
 VerifiedMatchedSubjectAltName, "verified_matchedSubjectAltName"
 VerifiedNameMatched, "verified_nameMatched"
 VerifiedHostnameFailMessage, "verified_hostnameFailMessage"
-VerifiedCertSuccess, "verified_cert_success"
+
+/* ---- Used in Cert Signature Algorithm Verification ---- */
+SignatureAlgorithmCertSHA1, "signature_algorithm_verified_cert_sha1"
+
+/* ---- Used in Cert Failure Verification ---- */
+FailureVerifiedCertDepthInChain, "failure_verified_cert_depth_in_chain"
+VerifiedChainFailuresOverridden, "verified_chain_failures_overridden"
+VerifiedChainFailureVerificationTime, "verified_chain_failure_verification_time"
+
+/* ---- Used in Cert Timestamp Verification ---- */
+TimestampVerifiedCertNotAfterTime, "timestamp_verified_cert_not_after_time"
+TimestampVerifiedCertNotBeforeTime, "timestamp_verified_cert_not_before_time"
+TimestampVerifiedClientTimeOverride, "timestamp_verified_client_time_override"
+TimestampVerifiedTrustedTime, "timestamp_verified_trusted_time"
+
+/* ---- Used in Cert Key Length Verification ---- */
+VerifiedKeyLengthSuccess, "verified_key_length_success"
 
 /* ---- Used in Cert Pinning ---- */
 PinningReason, "verified_pinning_reason"
@@ -225,6 +250,7 @@ ZeroAEAD, "zero_aead"
 ZeroKex, "zero_kex"
 ZeroVersion, "zero_version"
 ZeroRttEnabled, "zero_rtt_enabled"
+ZeroFallbackEnabled, "zero_fallback_enabled"
 
 /* --- Used in ZeroVerification --- */
 ZeroVerifiedSuccess, "zero_verified_success"
@@ -233,6 +259,10 @@ ZeroVerifiedError, "zero_verified_error"
 TransportRttCompleted, "transport_rtt_completed"
 UnparsedDataSize, "unparsed_data_size"
 UnparsedData, "unparsed_data"
+
+/* --- Used in ZeroConnector -- */
+TFOAttempted, "tfo_attempted"
+TFOFinished, "tfo_finished"
 
 /* --- Used in MQTT Client --- */
 MQTTConnAttempts, "mqtt_conn_attempts"
@@ -247,10 +277,16 @@ TransportType, "transport_type"
 /* --- Used in MQTTMessage --- */
 MQTTMsgRemainingLength, "mqtt_msg_remaining_length"
 MsgType, "msg_type"
-IsMsgRecv, "is_msg_received"
+IsMsgRecv, "is_msg_received"lishV
 ConnectReturnCode, "connect_return_code"
+MQTTMsgBytes, "mqtt_msg_bytes"
+MsgTopic, "msg_topic"
+QoS, "qos"
 
 /* ---- Used in Push ----*/
 IsPushRequest, "is_push_request"
 PushConnectedInFlight, "push_connected_in_flight"
 PushOrphaned, "push_orphaned"
+
+/* ---- Used in analytics logging ----*/
+AnalyticsTags, "analytics_tags"

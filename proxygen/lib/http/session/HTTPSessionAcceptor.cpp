@@ -58,7 +58,7 @@ void HTTPSessionAcceptor::onNewConnection(
   folly::AsyncTransportWrapper::UniquePtr sock,
   const SocketAddress* peerAddress,
   const string& nextProtocol,
-  SecureTransportType secureTransportType,
+  wangle::SecureTransportType secureTransportType,
   const wangle::TransportInfo& tinfo) {
 
   unique_ptr<HTTPCodec> codec
@@ -66,6 +66,7 @@ void HTTPSessionAcceptor::onNewConnection(
 
   if (!codec) {
     VLOG(2) << "codecFactory_ failed to provide codec";
+    onSessionCreationError(ProxygenError::kErrorUnsupportedScheme);
     return;
   }
 

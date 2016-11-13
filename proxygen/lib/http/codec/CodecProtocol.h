@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <string>
 #include <boost/optional.hpp>
+#include <proxygen/lib/utils/Export.h>
 
 namespace proxygen {
 
@@ -19,7 +20,6 @@ enum class CodecProtocol : uint8_t {
   HTTP_1_1,
   SPDY_3,
   SPDY_3_1,
-  SPDY_3_1_HPACK,
   HTTP_2,
 };
 
@@ -42,7 +42,7 @@ extern CodecProtocol getCodecProtocolFromStr(const std::string& protocolStr);
 /**
  * Check if the given protocol is SPDY.
  */
-extern bool isSpdyCodecProtocol(CodecProtocol protocol);
+FB_EXPORT extern bool isSpdyCodecProtocol(CodecProtocol protocol);
 
 /**
  * Check if the given protocol is HTTP2.

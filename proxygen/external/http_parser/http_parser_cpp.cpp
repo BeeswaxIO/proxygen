@@ -419,6 +419,12 @@ enum http_host_state
   (IS_ALPHANUM(c) || (c) == '.' || (c) == '-' || (c) == '_')
 #endif
 
+/**
+ * Verify that a char is a valid visible (printable) US-ASCII
+ * character or %x80-FF
+ **/
+#define IS_HEADER_CHAR(ch)                                                     \
+  (ch == CR || ch == LF || ch == 9 || ((unsigned char)ch > 31 && ch != 127))
 
 #define start_state (parser->type == HTTP_REQUEST ? s_pre_start_req : s_pre_start_res)
 
@@ -614,6 +620,7 @@ size_t http_parser_execute (http_parser *parser,
    * callback.
    */
   unsigned char state = parser->state;
+  const unsigned int lenient = 0;
 
   /* We're in an error state. Don't bother doing anything. */
   if (HTTP_PARSER_ERRNO(parser) != HPE_OK) {
@@ -1560,6 +1567,13 @@ size_t http_parser_execute (http_parser *parser,
         notatoken:
         if (ch == ':') {
           state = s_header_value_start;
+          // do not allow headers with trailing whitespaces
+          // https://tools.ietf.org/html/rfc7230#section-3.2.4
+          if (p - header_field_mark > 1 &&
+              data[p - data - 1] == ' ') {
+            SET_ERRNO(HPE_INVALID_HEADER_TOKEN);
+            goto error;
+          }
           CALLBACK_DATA(header_field);
           break;
         }
@@ -1642,6 +1656,12 @@ size_t http_parser_execute (http_parser *parser,
           goto reexecute_byte;
         }
 
+        if (!lenient && !IS_HEADER_CHAR(ch) &&
+            parser->header_state != h_general_and_quote_and_escape) {
+          SET_ERRNO(HPE_INVALID_HEADER_TOKEN);
+          goto error;
+        }
+
         switch (parser->header_state) {
           case h_general:
             if (ch == QT) {
@@ -1652,7 +1672,8 @@ size_t http_parser_execute (http_parser *parser,
             #define MOVE_FAST do {                    \
               ++p;                                    \
               ch = *p;                                \
-              if (ch == CR || ch == LF || ch == QT) { \
+              if (ch == CR || ch == LF || ch == QT || \
+                  ch == BS || !IS_HEADER_CHAR(ch)) {  \
                 goto cr_or_lf_or_qt;                  \
               }                                       \
             } while(0);
@@ -1777,6 +1798,11 @@ size_t http_parser_execute (http_parser *parser,
       case s_headers_almost_done:
       {
         STRICT_CHECK(ch != LF);
+
+        if (ch != LF) {
+          SET_ERRNO(HPE_STRICT);
+          goto error;
+        }
 
         if (parser->flags & F_TRAILING) {
           /* End of a chunked request */

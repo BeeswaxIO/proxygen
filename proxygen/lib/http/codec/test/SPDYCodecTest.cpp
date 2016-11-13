@@ -13,6 +13,7 @@
 #include <proxygen/lib/http/codec/SPDYCodec.h>
 #include <proxygen/lib/http/codec/SPDYConstants.h>
 #include <proxygen/lib/http/codec/SPDYVersionSettings.h>
+#include <proxygen/lib/http/codec/test/HTTPParallelCodecTest.h>
 #include <proxygen/lib/http/codec/test/TestUtils.h>
 #include <proxygen/lib/http/codec/compress/Logging.h>
 #include <random>
@@ -1310,9 +1311,9 @@ TEST(SPDYCodecTest, ShortSettings) {
 
 TEST(SPDYCodecTest, SegmentedHeaderBlock) {
   SPDYCodec egressCodec(TransportDirection::UPSTREAM,
-                        SPDYVersion::SPDY3_1_HPACK);
+                        SPDYVersion::SPDY3_1);
   SPDYCodec ingressCodec(TransportDirection::DOWNSTREAM,
-                         SPDYVersion::SPDY3_1_HPACK);
+                         SPDYVersion::SPDY3_1);
   // generate huge string to use as a header value
   string huge;
   uint32_t size = 20000;
@@ -1381,34 +1382,9 @@ TEST(SPDYCodecTest, ColonHeaders) {
   EXPECT_EQ(callbacks.sessionErrors, 0);
 }
 
-// this magic blob contains a pair of invalid header "key='', value='x'" encoded
-// with HPACK. It's not easy to generate it, as any use of HTTPHeaders will
-// hit an assert for name size before we have the chance to decode
-const uint8_t kBufEmptyHeader[] = {
-  0x80, 0x3, 0x0, 0x1, 0x0, 0x0, 0x0, 0x0e, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0x0,
-  0x0, 0x0, 0x0, 0x0, 0x80, 0x81, 0xea
-};
-
-/**
- * make sure we're not hitting CHECK on header name size when receiving a rogue
- * header from the client
- */
-TEST(SPDYCodecTest, EmptyHeaderName) {
-  FakeHTTPCodecCallback callbacks;
-  SPDYCodec ingressCodec(TransportDirection::DOWNSTREAM,
-                         SPDYVersion::SPDY3_1_HPACK);
-
-  auto testBuf = IOBuf::copyBuffer(kBufEmptyHeader, sizeof(kBufEmptyHeader));
-  ingressCodec.setCallback(&callbacks);
-  ingressCodec.onIngress(*testBuf);
-  EXPECT_EQ(callbacks.headersComplete, 0);
-  EXPECT_EQ(callbacks.streamErrors, 1);
-  EXPECT_EQ(callbacks.sessionErrors, 0);
-}
-
 TEST(SPDYCodecTest, StreamIdOverflow) {
   SPDYCodec codec(TransportDirection::UPSTREAM,
-                  SPDYVersion::SPDY3_1_HPACK);
+                  SPDYVersion::SPDY3_1);
 
   HTTPCodec::StreamID streamId;
   codec.setNextEgressStreamId(std::numeric_limits<int32_t>::max() - 10);
@@ -1440,4 +1416,72 @@ TEST(SPDYCodecTest, BadNVBlock) {
   EXPECT_EQ(callbacks.headersComplete, 0);
   EXPECT_EQ(callbacks.streamErrors, 0);
   EXPECT_EQ(callbacks.sessionErrors, 1);
+}
+
+class SPDYCodecTestF : public HTTPParallelCodecTest {
+
+ public:
+  SPDYCodecTestF()
+      : HTTPParallelCodecTest(upstreamCodec_, downstreamCodec_) {}
+
+ protected:
+  SPDYCodec upstreamCodec_{TransportDirection::UPSTREAM, SPDYVersion::SPDY3_1};
+  SPDYCodec downstreamCodec_{TransportDirection::DOWNSTREAM,
+      SPDYVersion::SPDY3_1};
+};
+
+TEST_F(SPDYCodecTestF, GoawayHandling) {
+  // send request
+  HTTPMessage req = getGetRequest();
+  HTTPHeaderSize size;
+  size.uncompressed = size.compressed = 0;
+  upstreamCodec_.generateHeader(output_, 1, req, 0, true, &size);
+  EXPECT_GT(size.uncompressed, 0);
+  parse();
+  callbacks_.expectMessage(true, 2, "/");
+  callbacks_.reset();
+
+  SetUpUpstreamTest();
+  // drain after this message
+  downstreamCodec_.generateGoaway(output_, 1, ErrorCode::NO_ERROR);
+  parseUpstream();
+  // upstream cannot generate id > 1
+  upstreamCodec_.generateHeader(output_, 3, req, 0, false, &size);
+  EXPECT_EQ(size.uncompressed, 0);
+  upstreamCodec_.generateWindowUpdate(output_, 3, 100);
+  upstreamCodec_.generateBody(output_, 3, makeBuf(10), boost::none, false);
+  upstreamCodec_.generatePriority(output_, 3,
+                                  HTTPMessage::HTTPPriority(0, true, 1));
+  upstreamCodec_.generateEOM(output_, 3);
+  upstreamCodec_.generateRstStream(output_, 3, ErrorCode::CANCEL);
+  EXPECT_EQ(output_.chainLength(), 0);
+
+  // send a push promise that will be rejected by downstream
+  req.setPushStatusCode(200);
+  req.getHeaders().add("foomonkey", "george");
+  downstreamCodec_.generateHeader(output_, 2, req, 1, false, &size);
+  EXPECT_GT(size.uncompressed, 0);
+  // window update for push doesn't make any sense, but whatever
+  downstreamCodec_.generateWindowUpdate(output_, 2, 100);
+  downstreamCodec_.generateBody(output_, 2, makeBuf(10), boost::none, false);
+
+  // tell the upstream no pushing, and parse the first batch
+  IOBufQueue dummy{IOBufQueue::cacheChainLength()};
+  upstreamCodec_.generateGoaway(dummy, 0, ErrorCode::NO_ERROR);
+  parseUpstream();
+
+  downstreamCodec_.generatePriority(output_, 2,
+                                    HTTPMessage::HTTPPriority(0, true, 1));
+  downstreamCodec_.generateEOM(output_, 2);
+  downstreamCodec_.generateRstStream(output_, 2, ErrorCode::CANCEL);
+
+  // send a response that will be accepted, headers should be ok
+  HTTPMessage resp;
+  resp.setStatusCode(200);
+  downstreamCodec_.generateHeader(output_, 1, resp, 0, true, &size);
+  EXPECT_GT(size.uncompressed, 0);
+
+  // parse the remainder
+  parseUpstream();
+  callbacks_.expectMessage(true, 1, 200);
 }

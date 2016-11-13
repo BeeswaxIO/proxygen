@@ -432,6 +432,7 @@ HTTP1xCodec::generateHeader(IOBufQueue& writeBuf,
     } else if (code == HTTP_HEADER_UPGRADE && upstream && txn == 1) {
       // save in case we get a 101 Switching Protocols
       upgradeHeader_ = value;
+      hasUpgradeHeader = true;
     } else if (!hasTransferEncodingChunked &&
                code == HTTP_HEADER_TRANSFER_ENCODING) {
       static const string kChunked = "chunked";
@@ -783,6 +784,27 @@ int
 HTTP1xCodec::onHeadersComplete(size_t len) {
   if (headerParseState_ == HeaderParseState::kParsingHeaderValue) {
     pushHeaderNameAndValue(msg_->getHeaders());
+  }
+
+  // discard messages with multiple content-length headers (t12767790)
+  HTTPHeaders& hdrs = msg_->getHeaders();
+  if (hdrs.getNumberOfValues("Content-Length") > 1) {
+    // Only reject the message if the Content-Length headers have different
+    // values
+    folly::Optional<folly::StringPiece> contentLen;
+    bool error = hdrs.forEachValueOfHeader(
+        "Content-Length", [&] (folly::StringPiece value) -> bool {
+      if (!contentLen.hasValue()) {
+        contentLen = value;
+        return false;
+      }
+      return (contentLen.value() != value);
+    });
+
+    if (error) {
+      LOG(ERROR) << "Invalid message, multiple Content-Length headers";
+      return -1;
+    }
   }
 
   // Update the HTTPMessage with the values parsed from the header

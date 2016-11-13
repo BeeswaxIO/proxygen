@@ -19,7 +19,6 @@
 #include <proxygen/lib/http/session/HTTPSessionController.h>
 #include <proxygen/lib/http/session/HTTPSessionStats.h>
 #include <folly/io/async/AsyncSSLSocket.h>
-#include <folly/MoveWrapper.h>
 
 using folly::AsyncSSLSocket;
 using folly::AsyncSocket;
@@ -184,7 +183,7 @@ void HTTPSession::setupCodec() {
   if (!codec_->supportsParallelRequests()) {
     // until we support upstream pipelining
     maxConcurrentIncomingStreams_ = 1;
-    maxConcurrentOutgoingStreamsConfig_ = isDownstream() ? 0 : 1;
+    maxConcurrentOutgoingStreamsRemote_ = isDownstream() ? 0 : 1;
   }
 
   HTTPSettings* settings = codec_->getEgressSettings();
@@ -269,9 +268,7 @@ void HTTPSession::setFlowControl(size_t initialReceiveWindow,
 
 void HTTPSession::setMaxConcurrentOutgoingStreams(uint32_t num) {
   CHECK(!started_);
-  if (codec_->supportsParallelRequests()) {
-    maxConcurrentOutgoingStreamsConfig_ = num;
-  }
+  maxConcurrentOutgoingStreamsConfig_ = num;
 }
 
 void HTTPSession::setMaxConcurrentIncomingStreams(uint32_t num) {
@@ -448,7 +445,7 @@ HTTPSession::isBufferMovable() noexcept {
 
 void
 HTTPSession::readBufferAvailable(std::unique_ptr<IOBuf> readBuf) noexcept {
-  size_t readSize = readBuf->length();
+  size_t readSize = readBuf->computeChainDataLength();
   VLOG(5) << "read completed on " << *this << ", bytes=" << readSize;
 
   DestructorGuard dg(this);
@@ -500,7 +497,7 @@ HTTPSession::readEOF() noexcept {
   // due to client-side issues with the SSL cert. Note that it can also
   // happen if the client sends a SPDY frame header but no body.
   if (infoCallback_
-      && transportInfo_.ssl && transactionSeqNo_ == 0 && readBuf_.empty()) {
+      && transportInfo_.secure && transactionSeqNo_ == 0 && readBuf_.empty()) {
     infoCallback_->onIngressError(*this, kErrorClientSilent);
   }
 
@@ -716,7 +713,7 @@ HTTPSession::onHeadersComplete(HTTPCodec::StreamID streamID,
   const char* sslCipher =
       transportInfo_.sslCipher ? transportInfo_.sslCipher->c_str() : nullptr;
   msg->setSecureInfo(transportInfo_.sslVersion, sslCipher);
-  msg->setSecure(transportInfo_.ssl);
+  msg->setSecure(transportInfo_.secure);
 
   setupOnHeadersComplete(txn, msg.get());
 
@@ -1087,6 +1084,9 @@ void HTTPSession::onSettingsAck() {
 
 void HTTPSession::onPriority(HTTPCodec::StreamID streamID,
                              const HTTPMessage::HTTPPriority& pri) {
+  if (!getHTTP2PrioritiesEnabled()) {
+    return;
+  }
   http2::PriorityUpdate h2Pri{std::get<0>(pri), std::get<1>(pri),
       std::get<2>(pri)};
   HTTPTransaction* txn = findTransaction(streamID);
@@ -1108,15 +1108,14 @@ bool HTTPSession::onNativeProtocolUpgradeImpl(
   // only HTTP1xCodec calls onNativeProtocolUpgrade
   CHECK(!codec_->supportsParallelRequests());
 
-  // Reset to defaults
+  // Reset to  defaults
   maxConcurrentIncomingStreams_ = 100;
-  maxConcurrentOutgoingStreamsConfig_ = 100;
+  maxConcurrentOutgoingStreamsRemote_ = 10000;
 
   // overwrite destination, delay current codec deletion until the end
   // of the event loop
   auto oldCodec = codec_.setDestination(std::move(codec));
-  folly::MoveWrapper<std::unique_ptr<HTTPCodec>> wrapper(std::move(oldCodec));
-  sock_->getEventBase()->runInLoop([wrapper] () {});
+  sock_->getEventBase()->runInLoop([oldCodec = std::move(oldCodec)] () {});
 
   if (controller_) {
     controller_->onSessionCodecChange(this);
@@ -1128,6 +1127,11 @@ bool HTTPSession::onNativeProtocolUpgradeImpl(
   (void)codec_->createStream();
 
   // trigger settings frame that would have gone out in startNow()
+  HTTPSettings* settings = codec_->getEgressSettings();
+  if (settings) {
+    settings->setSetting(SettingsId::INITIAL_WINDOW_SIZE,
+                         initialReceiveWindow_);
+  }
   sendSettings();
   if (connFlowControl_) {
     connFlowControl_->setReceiveWindowSize(writeBuf_,
@@ -1141,7 +1145,7 @@ bool HTTPSession::onNativeProtocolUpgradeImpl(
              receiveStreamWindowSize_,
              getCodecSendWindowSize());
 
-  if (!transportInfo_.ssl &&
+  if (!transportInfo_.secure &&
       (!transportInfo_.sslNextProtocol ||
        transportInfo_.sslNextProtocol->empty())) {
     transportInfo_.sslNextProtocol = std::make_shared<string>(
@@ -1252,8 +1256,10 @@ void HTTPSession::sendHeaders(HTTPTransaction* txn,
   }
   if (isUpstream() || (txn->isPushed() && headers.isRequest())) {
     // upstream picks priority
-    auto pri = getMessagePriority(&headers);
-    txn->onPriorityUpdate(pri);
+    if (getHTTP2PrioritiesEnabled()) {
+      auto pri = getMessagePriority(&headers);
+      txn->onPriorityUpdate(pri);
+    }
   }
 
   const bool wasReusable = codec_->isReusable();
@@ -1621,7 +1627,7 @@ bool HTTPSession::getCurrentTransportInfo(TransportInfo* tinfo) {
   if (getCurrentTransportInfoWithoutUpdate(tinfo)) {
     // some fields are the same with the setup transport info
     tinfo->setupTime = transportInfo_.setupTime;
-    tinfo->ssl = transportInfo_.ssl;
+    tinfo->secure = transportInfo_.secure;
     tinfo->sslSetupTime = transportInfo_.sslSetupTime;
     tinfo->sslVersion = transportInfo_.sslVersion;
     tinfo->sslCipher = transportInfo_.sslCipher;
@@ -1642,8 +1648,11 @@ bool HTTPSession::getCurrentTransportInfo(TransportInfo* tinfo) {
 }
 
 void HTTPSession::setByteEventTracker(
-    std::unique_ptr<ByteEventTracker> byteEventTracker) {
-  byteEventTracker_ = std::move(byteEventTracker);
+    std::shared_ptr<ByteEventTracker> byteEventTracker) {
+  if (byteEventTracker && byteEventTracker_) {
+    byteEventTracker->absorb(std::move(*byteEventTracker_));
+  }
+  byteEventTracker_ = byteEventTracker;
   if (byteEventTracker_) {
     byteEventTracker_->setCallback(this);
     byteEventTracker_->setTTLBAStats(sessionStats_);
@@ -2233,10 +2242,13 @@ HTTPSession::onWriteSuccess(uint64_t bytesWritten) {
 
   VLOG(5) << "total bytesWritten_: " << bytesWritten_;
 
-  if (byteEventTracker_) {
-    byteEventTracker_->processByteEvents(bytesWritten_,
-                                         sock_->isEorTrackingEnabled());
-  }
+  // processByteEvents will return true if it has been replaced with another
+  // tracker in the middle and needs to be re-run.  Should happen at most
+  // once.  while with no body is intentional
+  while (byteEventTracker_ &&
+         byteEventTracker_->processByteEvents(
+           byteEventTracker_, bytesWritten_,
+           sock_->isEorTrackingEnabled())) {} // pass
 
   if ((!codec_->isReusable() || readsShutdown()) && (transactions_.empty())) {
     if (!codec_->isReusable()) {
@@ -2250,7 +2262,8 @@ HTTPSession::onWriteSuccess(uint64_t bytesWritten) {
   numActiveWrites_--;
   if (!inLoopCallback_) {
     updateWriteCount();
-    updateWriteBufSize(-bytesWritten); // safe to resume here
+    // safe to resume here:
+    updateWriteBufSize(-folly::to<int64_t>(bytesWritten));
     // PRIO_FIXME: this is done because of the corking business...
     //             in the future we may want to have a pull model
     //             whereby the socket asks us for a given amount of
@@ -2363,6 +2376,10 @@ HTTPSession::pauseReads() {
        pendingReadSize_ <= readBufLimit_)) {
     return;
   }
+  pauseReadsImpl();
+}
+
+void HTTPSession::pauseReadsImpl() {
   VLOG(4) << *this << ": pausing reads";
   if (infoCallback_) {
     infoCallback_->onIngressPaused(*this);
@@ -2379,6 +2396,10 @@ HTTPSession::resumeReads() {
        pendingReadSize_ > readBufLimit_)) {
     return;
   }
+  resumeReadsImpl();
+}
+
+void HTTPSession::resumeReadsImpl() {
   VLOG(4) << *this << ": resuming reads";
   resetTimeout();
   reads_ = SocketState::UNPAUSED;

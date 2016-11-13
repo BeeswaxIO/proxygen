@@ -14,6 +14,7 @@
 #include <folly/io/async/EventBaseManager.h>
 #include <glog/logging.h>
 #include <proxygen/lib/http/HTTPHeaderSize.h>
+#include <proxygen/lib/http/RFC2616.h>
 #include <proxygen/lib/http/codec/SPDYConstants.h>
 #include <proxygen/lib/http/session/HTTPSessionStats.h>
 
@@ -64,7 +65,8 @@ HTTPTransaction::HTTPTransaction(TransportDirection direction,
     inResume_(false),
     inActiveSet_(true),
     ingressErrorSeen_(false),
-    priorityFallback_(false) {
+    priorityFallback_(false),
+    headRequest_(false) {
 
   if (assocStreamId_) {
     if (isUpstream()) {
@@ -81,7 +83,7 @@ HTTPTransaction::HTTPTransaction(TransportDirection direction,
 
   queueHandle_ = egressQueue_.addTransaction(id_, priority, this, false,
                                              &insertDepth_);
-  if(priority.streamDependency != 0 && insertDepth_ == 0) {
+  if(priority.streamDependency != 0 && insertDepth_ == 1) {
     priorityFallback_ = true;
   }
 
@@ -146,6 +148,21 @@ void HTTPTransaction::onIngressHeadersComplete(
         HTTPTransactionIngressSM::Event::onHeaders)) {
     return;
   }
+  if ((msg->isRequest() && msg->getMethod() != HTTPMethod::CONNECT) ||
+       (msg->isResponse() &&
+        !headRequest_ &&
+        !RFC2616::responseBodyMustBeEmpty(msg->getStatusCode()))) {
+    // CONNECT payload has no defined semantics
+    const auto& clHeader =
+      msg->getHeaders().getSingleOrEmpty(HTTP_HEADER_CONTENT_LENGTH);
+    if (!clHeader.empty()) {
+      try {
+        expectedContentLengthRemaining_ = folly::to<uint64_t>(clHeader);
+      } catch (const folly::ConversionError& ex) {
+        // ignore this, at least for now
+      }
+    }
+  }
   if (transportCallback_) {
     transportCallback_->headerBytesReceived(msg->getIngressHeaderSize());
   }
@@ -187,13 +204,32 @@ void HTTPTransaction::onIngressBody(unique_ptr<IOBuf> chain,
         HTTPTransactionIngressSM::Event::onBody)) {
     return;
   }
+  if (expectedContentLengthRemaining_.hasValue()) {
+    if (expectedContentLengthRemaining_.value() >= len) {
+      expectedContentLengthRemaining_ =
+        expectedContentLengthRemaining_.value() - len;
+    } else {
+      auto errorMsg = folly::to<std::string>(
+          "Content-Length/body mismatch: received=",
+          len,
+          " expecting no more than ",
+          expectedContentLengthRemaining_.value());
+      LOG(ERROR) << *this << " " << errorMsg;
+      if (handler_) {
+        HTTPException ex(HTTPException::Direction::INGRESS, errorMsg);
+        ex.setProxygenError(kErrorParseBody);
+        onError(ex);
+      }
+      return;
+    }
+  }
   if (transportCallback_) {
     transportCallback_->bodyBytesReceived(len);
   }
   if (mustQueueIngress()) {
     // register the bytes in the receive window
     if (!recvWindow_.reserve(len + padding, useFlowControl_)) {
-      LOG(ERROR) << *this << "recvWindow_.reserve failed with len=" << len <<
+      LOG(ERROR) << *this << " recvWindow_.reserve failed with len=" << len <<
         " padding=" << padding << " capacity=" << recvWindow_.getCapacity() <<
         " outstanding=" << recvWindow_.getOutstanding();
       sendAbort(ErrorCode::FLOW_CONTROL_ERROR);
@@ -350,6 +386,20 @@ void HTTPTransaction::onIngressEOM() {
     sendAbort(ErrorCode::STREAM_CLOSED);
     return;
   }
+  if (expectedContentLengthRemaining_.hasValue() &&
+      expectedContentLengthRemaining_.value() > 0) {
+    auto errorMsg = folly::to<std::string>(
+        "Content-Length/body mismatch: expecting another ",
+        expectedContentLengthRemaining_.value());
+    LOG(ERROR) << *this << " " << errorMsg;
+    if (handler_) {
+      HTTPException ex(HTTPException::Direction::INGRESS, errorMsg);
+      ex.setProxygenError(kErrorParseBody);
+      onError(ex);
+    }
+    return;
+  }
+
   // TODO: change the codec to not give an EOM callback after a 100 response?
   // We could then delete the below 'if'
   if (isUpstream() && extraResponseExpected()) {
@@ -422,7 +472,9 @@ void HTTPTransaction::markIngressComplete() {
 void HTTPTransaction::markEgressComplete() {
   VLOG(4) << "Marking egress complete on " << *this;
   if (deferredEgressBody_.chainLength() && isEnqueued()) {
-    transport_.notifyEgressBodyBuffered(-deferredEgressBody_.chainLength());
+    int64_t deferredEgressBodyBytes =
+      folly::to<int64_t>(deferredEgressBody_.chainLength());
+    transport_.notifyEgressBodyBuffered(-deferredEgressBodyBytes);
   }
   deferredEgressBody_.move();
   if (isEnqueued()) {
@@ -588,7 +640,7 @@ void HTTPTransaction::onEgressTimeout() {
     HTTPException ex(HTTPException::Direction::EGRESS,
       folly::to<std::string>("egress timeout, streamID=", id_));
     ex.setProxygenError(kErrorTimeout);
-    handler_->onError(ex);
+    onError(ex);
   } else {
     markEgressComplete();
   }
@@ -630,6 +682,9 @@ void HTTPTransaction::sendHeadersWithOptionalEOM(
   DCHECK(!isEgressComplete());
   if (isDownstream() && !isPushed()) {
     lastResponseStatus_ = headers.getStatusCode();
+  }
+  if (headers.isRequest()) {
+    headRequest_ = (headers.getMethod() == HTTPMethod::HEAD);
   }
   HTTPHeaderSize size;
   transport_.sendHeaders(this, headers, &size, eom);
@@ -1047,7 +1102,9 @@ void HTTPTransaction::notifyTransportPendingEgress() {
     }
   } else if (isEnqueued()) {
     // Nothing to send, or not allowed to send right now.
-    transport_.notifyEgressBodyBuffered(-deferredEgressBody_.chainLength());
+    int64_t deferredEgressBodyBytes =
+      folly::to<int64_t>(deferredEgressBody_.chainLength());
+    transport_.notifyEgressBodyBuffered(-deferredEgressBodyBytes);
     egressQueue_.clearPendingEgress(queueHandle_);
   }
   updateHandlerPauseState();
@@ -1179,7 +1236,7 @@ void HTTPTransaction::onPriorityUpdate(const http2::PriorityUpdate& priority) {
       queueHandle_,
       priority_,
       &currentDepth_);
-  if(priority_.streamDependency != 0 && currentDepth_ == 0) {
+  if(priority_.streamDependency != 0 && currentDepth_ == 1) {
     priorityFallback_ = true;
   }
 }

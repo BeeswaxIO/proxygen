@@ -9,7 +9,6 @@
  */
 #include <folly/Conv.h>
 #include <folly/Foreach.h>
-#include <folly/MoveWrapper.h>
 #include <folly/futures/Promise.h>
 #include <wangle/acceptor/ConnectionManager.h>
 #include <folly/io/Cursor.h>
@@ -266,18 +265,21 @@ class HTTPDownstreamTest : public testing::Test {
 
   void expectResponse(uint32_t code = 200,
                       ErrorCode errorCode = ErrorCode::NO_ERROR,
-                      bool expect100 = false) {
+                      bool expect100 = false, bool expectGoaway = false) {
     NiceMock<MockHTTPCodecCallback> callbacks;
     clientCodec_->setCallback(&callbacks);
     if (isParallelCodecProtocol(clientCodec_->getProtocol())) {
       EXPECT_CALL(callbacks, onSettings(_))
         .WillOnce(Invoke([this] (const SettingsList& settings) {
               if (flowControl_[0] > 0) {
+                bool foundInitialWindow = false;
                 for (const auto& setting: settings) {
                   if (setting.id == SettingsId::INITIAL_WINDOW_SIZE) {
                     EXPECT_EQ(flowControl_[0], setting.value);
+                    foundInitialWindow = true;
                   }
                 }
+                EXPECT_TRUE(foundInitialWindow);
               }
             }));
     }
@@ -295,6 +297,11 @@ class HTTPDownstreamTest : public testing::Test {
       if (clientCodec_->supportsStreamFlowControl() && streamDelta) {
         EXPECT_CALL(callbacks, onWindowUpdate(1, streamDelta));
       }
+    }
+
+    if (expectGoaway) {
+      EXPECT_CALL(callbacks, onGoaway(HTTPCodec::StreamID(1),
+                                      ErrorCode::NO_ERROR, _));
     }
 
     uint8_t times = (expect100) ? 2 : 1;
@@ -780,6 +787,43 @@ TEST(HTTPDownstreamTest, byte_events_drained) {
   evb.loop();
 }
 
+TEST_F(HTTP2DownstreamSessionTest, set_byte_event_tracker) {
+  InSequence enforceOrder;
+
+  // Send two requests with writes paused, which will queue several byte events,
+  // including last byte events which are holding a reference to the
+  // transaction.
+  transport_->pauseWrites();
+  auto handler1 = addSimpleStrictHandler();
+  handler1->expectHeaders();
+  handler1->expectEOM([&handler1] () {
+      handler1->sendReplyWithBody(200, 100);
+    });
+  auto handler2 = addSimpleStrictHandler();
+  handler2->expectHeaders();
+  handler2->expectEOM([&handler2] () {
+      handler2->sendReplyWithBody(200, 100);
+    });
+
+  sendRequest();
+  sendRequest();
+  // Resume writes from the loop callback
+  eventBase_.runInLoop([this] {
+      transport_->resumeWrites();
+    });
+
+  // The original byteEventTracker will process the last byte event of the
+  // first transaction, and detach by deleting the event.  Swap out the tracker.
+  handler1->expectDetachTransaction([this] {
+      auto tracker = folly::make_unique<ByteEventTracker>(httpSession_);
+      httpSession_->setByteEventTracker(std::move(tracker));
+    });
+  // handler2 should also be detached immediately because the new
+  // ByteEventTracker continues procesing where the old one left off.
+  handler2->expectDetachTransaction();
+  gracefulShutdown();
+}
+
 TEST_F(HTTPDownstreamSessionTest, trailers) {
   testChunks(true);
 }
@@ -1003,7 +1047,7 @@ TEST_F(HTTPDownstreamSessionTest, http_rate_limit_normal) {
     transport_->getWriteEvents()->back()->getTime();
   int64_t writeDuration =
     (int64_t)millisecondsBetween(timeLastWrite, timeFirstWrite).count();
-  EXPECT_GT(writeDuration, 800);
+  EXPECT_GE(writeDuration, 800);
 
   cleanup();
 }
@@ -1045,7 +1089,7 @@ TEST_F(SPDY3DownstreamSessionTest, spdy_rate_limit_normal) {
     transport_->getWriteEvents()->back()->getTime();
   int64_t writeDuration =
     (int64_t)millisecondsBetween(timeLastWrite, timeFirstWrite).count();
-  EXPECT_GT(writeDuration, 800);
+  EXPECT_GE(writeDuration, 800);
   expectDetachSession();
 }
 
@@ -1288,7 +1332,7 @@ void HTTPDownstreamTest<C>::testSimpleUpgrade(
   handler->expectHeaders();
   EXPECT_CALL(mockController_, onSessionCodecChange(httpSession_));
   handler->expectEOM([&handler, expectedUpgradeHeader] {
-      EXPECT_FALSE(handler->txn_->getSetupTransportInfo().ssl);
+      EXPECT_FALSE(handler->txn_->getSetupTransportInfo().secure);
       EXPECT_EQ(*handler->txn_->getSetupTransportInfo().sslNextProtocol,
                 expectedUpgradeHeader);
       handler->sendReplyWithBody(200, 100);
@@ -1501,22 +1545,55 @@ TEST_F(SPDY3DownstreamSessionTest, spdy_prio) {
   cleanup();
 }
 
+// Test sending a GOAWAY while the downstream session is still processing
+// the request that was an upgrade.  The reply GOAWAY should have last good
+// stream = 1, not 0.
+TEST_F(HTTPDownstreamSessionTest, http_upgrade_goaway_drain) {
+  this->getCodec().setAllowedUpgradeProtocols({"h2c"});
+  auto handler = addSimpleStrictHandler();
+  handler->expectHeaders();
+  handler->expectBody();
+  EXPECT_CALL(mockController_, onSessionCodecChange(httpSession_));
+  handler->expectEOM();
+  handler->expectDetachTransaction();
+
+  HTTPMessage req = getUpgradeRequest("h2c", HTTPMethod::POST, 10);
+  auto streamID = sendRequest(req, false);
+  clientCodec_->generateBody(requests_, streamID, makeBuf(10),
+                             boost::none, true);
+  // cheat and not sending EOM, it's a no-op
+
+  flushRequestsAndLoop();
+  expect101(CodecProtocol::HTTP_2, "h2c");
+  clientCodec_->generateConnectionPreface(requests_);
+  clientCodec_->generateGoaway(requests_, 0, ErrorCode::NO_ERROR);
+  flushRequestsAndLoop();
+  eventBase_.runInLoop([&handler] {
+      handler->sendReplyWithBody(200, 100);
+    });
+  HTTPSession::DestructorGuard g(httpSession_);
+  eventBase_.loop();
+  expectResponse(200, ErrorCode::NO_ERROR, false, true);
+  expectDetachSession();
+}
+
 template <class C>
 void HTTPDownstreamTest<C>::testPriorities(uint32_t numPriorities) {
   uint32_t iterations = 10;
   uint32_t maxPriority = numPriorities - 1;
+  std::vector<std::unique_ptr<testing::NiceMock<MockHTTPHandler>>> handlers;
   for (int pri = numPriorities - 1; pri >= 0; pri--) {
     for (uint32_t i = 0; i < iterations; i++) {
       sendRequest("/", pri * (8 / numPriorities));
       InSequence handlerSequence;
       auto handler = addSimpleNiceHandler();
       auto rawHandler = handler.get();
-      auto handlerWrapper = folly::makeMoveWrapper(handler);
+      handlers.push_back(std::move(handler));
       rawHandler->expectHeaders();
       rawHandler->expectEOM([rawHandler] {
           rawHandler->sendReplyWithBody(200, 1000);
         });
-      rawHandler->expectDetachTransaction([handlerWrapper] {  });
+      rawHandler->expectDetachTransaction([] {  });
     }
   }
 
@@ -2149,12 +2226,19 @@ TEST_F(HTTP2DownstreamSessionTest, server_push) {
 
   transport_->addReadEvent(output, milliseconds(0));
   clientCodec.generateRstStream(output, assocStreamId, ErrorCode::CANCEL);
-  clientCodec.generateGoaway(output, 0, ErrorCode::NO_ERROR);
+  clientCodec.generateGoaway(output, 2, ErrorCode::NO_ERROR);
   transport_->addReadEvent(output, milliseconds(200));
   transport_->startReadEvents();
   HTTPSession::DestructorGuard g(httpSession_);
   eventBase_.loop();
 
+  EXPECT_CALL(callbacks_, onMessageBegin(1, _));
+  EXPECT_CALL(callbacks_, onHeadersComplete(1, _));
+  EXPECT_CALL(callbacks_, onPushMessageBegin(2, 1, _));
+  EXPECT_CALL(callbacks_, onHeadersComplete(2, _));
+  EXPECT_CALL(callbacks_, onMessageBegin(2, _));
+  EXPECT_CALL(callbacks_, onHeadersComplete(2, _));
+  EXPECT_CALL(callbacks_, onMessageComplete(2, _));
   clientCodec.setCallback(&callbacks_);
   parseOutput(clientCodec);
   expectDetachSession();
@@ -2469,4 +2553,155 @@ TEST_F(HTTP2DownstreamSessionTest, test_priority_weights_tiny_window) {
   httpSession_->closeWhenIdle();
   expectDetachSession();
   this->eventBase_.loop();
+}
+
+TEST_F(HTTP2DownstreamSessionTest, test_short_content_length) {
+  InSequence enforceOrder;
+  auto req = getPostRequest(10);
+  auto streamID = sendRequest(req, false);
+  clientCodec_->generateBody(requests_, streamID, makeBuf(20),
+                             boost::none, true);
+  auto handler1 = addSimpleStrictHandler();
+
+  handler1->expectHeaders();
+  handler1->expectError([&handler1] (const HTTPException& ex) {
+      EXPECT_EQ(ex.getProxygenError(), kErrorParseBody);
+      handler1->txn_->sendAbort();
+    });
+  handler1->expectDetachTransaction();
+  flushRequestsAndLoop();
+
+  gracefulShutdown();
+}
+
+/**
+ * If handler chooses to untie itself with transaction during onError,
+ * detachTransaction shouldn't be expected
+ */
+TEST_F(HTTP2DownstreamSessionTest, test_bad_content_length_untie_handler) {
+  InSequence enforceOrder;
+  auto req = getPostRequest(10);
+  auto streamID = sendRequest(req, false);
+  clientCodec_->generateBody(
+      requests_,
+      streamID,
+      makeBuf(20),
+      boost::none,
+      true);
+  auto handler1 = addSimpleStrictHandler();
+
+  handler1->expectHeaders();
+  handler1->expectError([&] (const HTTPException&) {
+      if (handler1->txn_) {
+        handler1->txn_->setHandler(nullptr);
+      }
+      handler1->txn_ = nullptr;
+    });
+  flushRequestsAndLoop();
+
+  gracefulShutdown();
+}
+
+TEST_F(HTTP2DownstreamSessionTest, test_long_content_length) {
+  InSequence enforceOrder;
+  auto req = getPostRequest(30);
+  auto streamID = sendRequest(req, false);
+  clientCodec_->generateBody(requests_, streamID, makeBuf(20),
+                             boost::none, true);
+  auto handler1 = addSimpleStrictHandler();
+
+  handler1->expectHeaders();
+  handler1->expectBody();
+  handler1->expectError([&handler1] (const HTTPException& ex) {
+      EXPECT_EQ(ex.getProxygenError(), kErrorParseBody);
+      handler1->txn_->sendAbort();
+    });
+  handler1->expectDetachTransaction();
+  flushRequestsAndLoop();
+
+  gracefulShutdown();
+}
+
+TEST_F(HTTP2DownstreamSessionTest, test_malformed_content_length) {
+  InSequence enforceOrder;
+  auto req = getPostRequest();
+  req.getHeaders().set(HTTP_HEADER_CONTENT_LENGTH, "malformed");
+  auto streamID = sendRequest(req, false);
+  clientCodec_->generateBody(requests_, streamID, makeBuf(20),
+                             boost::none, true);
+  auto handler1 = addSimpleStrictHandler();
+
+  handler1->expectHeaders();
+  handler1->expectBody();
+  handler1->expectEOM([&handler1] {
+      handler1->sendReplyWithBody(200, 100);
+    });
+  handler1->expectDetachTransaction();
+  flushRequestsAndLoop();
+
+  gracefulShutdown();
+}
+
+TEST_F(HTTP2DownstreamSessionTest, test_head_content_length) {
+  InSequence enforceOrder;
+  auto req = getGetRequest();
+  req.setMethod(HTTPMethod::HEAD);
+  auto streamID = sendRequest(req);
+  auto handler1 = addSimpleStrictHandler();
+
+  handler1->expectHeaders();
+  handler1->expectEOM([&handler1] {
+      handler1->sendHeaders(200, 100);
+      // no body for head
+      handler1->txn_->sendEOM();
+    });
+  handler1->expectDetachTransaction();
+  flushRequestsAndLoop();
+
+  gracefulShutdown();
+}
+
+TEST_F(HTTP2DownstreamSessionTest, test_304_content_length) {
+  InSequence enforceOrder;
+  auto req = getGetRequest();
+  req.setMethod(HTTPMethod::HEAD);
+  auto streamID = sendRequest(req);
+  auto handler1 = addSimpleStrictHandler();
+
+  handler1->expectHeaders();
+  handler1->expectEOM([&handler1] {
+      handler1->sendHeaders(304, 100);
+      handler1->txn_->sendEOM();
+    });
+  handler1->expectDetachTransaction();
+  flushRequestsAndLoop();
+
+  gracefulShutdown();
+}
+
+// chunked with wrong content-length
+TEST_F(HTTPDownstreamSessionTest, http_short_content_length) {
+  InSequence enforceOrder;
+  auto req = getPostRequest(10);
+  req.setIsChunked(true);
+  req.getHeaders().add(HTTP_HEADER_TRANSFER_ENCODING, "chunked");
+  auto streamID = sendRequest(req, false);
+  clientCodec_->generateChunkHeader(requests_, streamID, 20);
+  clientCodec_->generateBody(requests_, streamID, makeBuf(20), boost::none,
+                             false);
+  clientCodec_->generateChunkTerminator(requests_, streamID);
+  clientCodec_->generateEOM(requests_, streamID);
+  auto handler1 = addSimpleStrictHandler();
+
+  handler1->expectHeaders();
+  EXPECT_CALL(*handler1, onChunkHeader(20));
+
+  handler1->expectError([&handler1] (const HTTPException& ex) {
+      EXPECT_EQ(ex.getProxygenError(), kErrorParseBody);
+      handler1->txn_->sendAbort();
+    });
+  handler1->expectDetachTransaction();
+  expectDetachSession();
+  flushRequestsAndLoop();
+
 }

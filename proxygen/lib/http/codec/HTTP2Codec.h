@@ -98,6 +98,9 @@ public:
       (transportDirection_ == TransportDirection::UPSTREAM &&
        egressSettings_.getSetting(SettingsId::ENABLE_PUSH, 1));
   }
+  void setHeaderCodecStats(HeaderCodec::Stats* stats) override {
+    headerCodec_.setStats(stats);
+  }
   size_t addPriorityNodes(
       PriorityQueue& queue,
       folly::IOBufQueue& writeBuf,
@@ -126,6 +129,8 @@ public:
       msg = msgIn;
       isRequest = isRequestIn;
       hasStatus = false;
+      hasContentLength = false;
+      contentLength = 0;
       regularHeaderSeen = false;
       parsingError = "";
       decodeError = HeaderDecodeError::NONE;
@@ -143,6 +148,8 @@ public:
     bool isRequest{false};
     bool hasStatus{false};
     bool regularHeaderSeen{false};
+    bool hasContentLength{false};
+    uint32_t contentLength{0};
     std::string parsingError;
     HeaderDecodeError decodeError{HeaderDecodeError::NONE};
   };
@@ -203,7 +210,6 @@ public:
     { SettingsId::MAX_HEADER_LIST_SIZE, 1 << 17 }, // same as SPDYCodec
   };
 #ifndef NDEBUG
-  uint32_t egressGoawayAck_{std::numeric_limits<uint32_t>::max()};
   uint64_t receivedFrameCount_{0};
 #endif
   enum FrameState {

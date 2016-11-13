@@ -9,6 +9,7 @@
  */
 #include <list>
 #include <map>
+#include <thread>
 
 #include <folly/Random.h>
 #include <folly/io/async/test/MockTimeoutManager.h>
@@ -70,8 +71,9 @@ class QueueTest : public testing::Test {
     q_.removeTransaction(handles_[id]);
   }
 
-  void updatePriority(HTTPCodec::StreamID id, http2::PriorityUpdate pri) {
-    handles_[id] = q_.updatePriority(handles_[id], pri);
+  void updatePriority(HTTPCodec::StreamID id, http2::PriorityUpdate pri,
+                      uint64_t* depth = nullptr) {
+    handles_[id] = q_.updatePriority(handles_[id], pri, depth);
   }
 
   void signalEgress(HTTPCodec::StreamID id, bool mark) {
@@ -131,7 +133,7 @@ TEST_F(QueueTest, Basic) {
   // Add another node, make sure we get the correct depth.
   uint64_t depth;
   addTransaction(11, {7, false, 15}, false, &depth);
-  EXPECT_EQ(depth, 2);
+  EXPECT_EQ(depth, 3);
 }
 
 TEST_F(QueueTest, RemoveLeaf) {
@@ -167,10 +169,29 @@ TEST_F(QueueTest, RemoveParentWeights) {
 TEST_F(QueueTest, UpdateWeight) {
   buildSimpleTree();
 
-  updatePriority(5, {1, false, 7});
+  uint64_t depth = 0;
+  updatePriority(5, {1, false, 7}, &depth);
   dump();
 
   EXPECT_EQ(nodes_, IDList({{1, 100}, {3, 20}, {5, 40}, {9, 100}, {7, 40}}));
+  EXPECT_EQ(depth, 2);
+}
+
+// Previously the code would allow duplicate entries in the priority tree under
+// certain circumstances.
+TEST_F(QueueTest, duplicateID) {
+  q_.addOrUpdatePriorityNode(1, {0, false, 15});
+  addTransaction(1, {0, true, 15});
+  q_.addOrUpdatePriorityNode(3, {1, false, 15});
+  addTransaction(5, {3, false, 15});
+  addTransaction(3, {5, false, 15});
+  removeTransaction(5);
+  auto stopFn = [this] {
+    return false;
+  };
+
+  dumpBFS(stopFn);
+  EXPECT_EQ(nodes_, IDList({{1, 100}, {3, 100}}));
 }
 
 TEST_F(QueueTest, UpdateWeightNotEnqueued) {
@@ -179,10 +200,12 @@ TEST_F(QueueTest, UpdateWeightNotEnqueued) {
 
   signalEgress(1, false);
   signalEgress(3, false);
-  updatePriority(1, {3, false, 7});
+  uint64_t depth = 0;
+  updatePriority(1, {3, false, 7}, &depth);
   dump();
 
   EXPECT_EQ(nodes_, IDList({{3, 100}, {1, 100}}));
+  EXPECT_EQ(depth, 2);
 }
 
 TEST_F(QueueTest, UpdateWeightExcl) {
@@ -615,6 +638,8 @@ class DanglingQueueTestBase {
 
  protected:
   void expireNodes() {
+    std::this_thread::sleep_for(
+      std::chrono::milliseconds(2 * HHWheelTimer::DEFAULT_TICK_INTERVAL));
     // Node lifetime it just under two ticks, so firing twice expires all nodes
     tick();
     tick();

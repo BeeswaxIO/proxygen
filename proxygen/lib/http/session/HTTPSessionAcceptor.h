@@ -116,7 +116,7 @@ protected:
     folly::AsyncTransportWrapper::UniquePtr sock,
     const folly::SocketAddress* address,
     const std::string& nextProtocol,
-    SecureTransportType secureTransportType,
+    wangle::SecureTransportType secureTransportType,
     const wangle::TransportInfo& tinfo) override;
 
   folly::AsyncSocket::UniquePtr makeNewAsyncSocket(folly::EventBase* base,
@@ -126,6 +126,8 @@ protected:
   }
 
   virtual size_t dropIdleConnections(size_t num);
+
+  virtual void onSessionCreationError(ProxygenError error) {}
 
 private:
   HTTPSessionAcceptor(const HTTPSessionAcceptor&) = delete;

@@ -26,7 +26,12 @@ TCPInfo, "TCPInfo"
 ConnInfo, "ConnInfo"
 ZeroSetup, "ZeroSetup"
 ZeroVerification, "ZeroVerification"
+ZeroConnector, "ZeroConnector"
 ReplaySafety, "ReplaySafety"
+HTTPPerfParameters, "HTTPPerfParameters"
+RetryFilter, "RetryFilter"
+ZeroFallback, "ZeroFallback"
+TLSCachedInfo, "TLSCachedInfo"
 
 /*
  * XXX: Too bad we have to define events in Liger core for the platform
