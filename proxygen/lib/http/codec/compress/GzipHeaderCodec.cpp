@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -69,20 +69,20 @@ struct ZlibContext {
   z_stream inflater;
 };
 
-namespace { struct BufferTag {}; }
-static folly::SingletonThreadLocal<unique_ptr<IOBuf>, BufferTag> s_buf{};
 folly::IOBuf& getStaticHeaderBufSpace(size_t size) {
-  if (!s_buf.get()) {
-    s_buf.get() = folly::make_unique<IOBuf>(IOBuf::CREATE, size);
+  struct BufferTag {};
+  auto& buf = folly::SingletonThreadLocal<unique_ptr<IOBuf>, BufferTag>::get();
+  if (!buf) {
+    buf = std::make_unique<IOBuf>(IOBuf::CREATE, size);
   } else {
-    if (size > s_buf.get()->capacity()) {
-      s_buf.get() = folly::make_unique<IOBuf>(IOBuf::CREATE, size);
+    if (size > buf->capacity()) {
+      buf = std::make_unique<IOBuf>(IOBuf::CREATE, size);
     } else {
-      s_buf.get()->clear();
+      buf->clear();
     }
   }
-  DCHECK(!s_buf.get()->isShared());
-  return *s_buf.get();
+  DCHECK(!buf->isShared());
+  return *buf;
 }
 
 void appendString(uint8_t*& dst, const string& str) {
@@ -91,23 +91,23 @@ void appendString(uint8_t*& dst, const string& str) {
   dst += len;
 }
 
-using ZlibContextMap = std::map<ZlibConfig, std::unique_ptr<ZlibContext>>;
-namespace { struct ContextTag {}; }
-static folly::SingletonThreadLocal<ZlibContextMap, ContextTag> s_zlibContexts{};
 /**
  * get the thread local cached zlib context
  */
 static const ZlibContext* getZlibContext(SPDYVersionSettings versionSettings,
                                          int compressionLevel) {
+  struct ContextTag {};
+  using ZlibContextMap = std::map<ZlibConfig, std::unique_ptr<ZlibContext>>;
+  auto& ctxmap = folly::SingletonThreadLocal<ZlibContextMap, ContextTag>::get();
   ZlibConfig zlibConfig(versionSettings.version, compressionLevel);
-  auto match = s_zlibContexts.get().find(zlibConfig);
-  if (match != s_zlibContexts.get().end()) {
+  auto match = ctxmap.find(zlibConfig);
+  if (match != ctxmap.end()) {
     return match->second.get();
   } else {
     // This is the first request for the specified SPDY version and compression
     // level in this thread, so we need to construct the initial compressor and
     // decompressor contexts.
-    auto newContext = folly::make_unique<ZlibContext>();
+    auto newContext = std::make_unique<ZlibContext>();
     newContext->deflater.zalloc = Z_NULL;
     newContext->deflater.zfree = Z_NULL;
     newContext->deflater.opaque = Z_NULL;
@@ -140,11 +140,11 @@ static const ZlibContext* getZlibContext(SPDYVersionSettings versionSettings,
     // double it if necessary
     newContext->inflater.reserved = 0x01;
 #endif
-    r = inflateInit2(&(newContext->inflater), 0);
+    r = inflateInit2(&(newContext->inflater), MAX_WBITS);
     CHECK_EQ(r, Z_OK);
 
     auto result = newContext.get();
-    s_zlibContexts.get().emplace(zlibConfig, std::move(newContext));
+    ctxmap.emplace(zlibConfig, std::move(newContext));
     return result;
   }
 }
@@ -367,9 +367,9 @@ GzipHeaderCodec::decode(Cursor& cursor, uint32_t length) noexcept {
 }
 
 void GzipHeaderCodec::decodeStreaming(
-    Cursor& cursor,
-    uint32_t length,
-    HeaderCodec::StreamingCallback* streamingCb) noexcept {
+    Cursor& /*cursor*/,
+    uint32_t /*length*/,
+    HeaderCodec::StreamingCallback* /*streamingCb*/) noexcept {
   // TODO: to implement, never called
 }
 

@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -9,7 +9,7 @@
  */
 #pragma once
 
-#include <gmock/gmock.h>
+#include <folly/portability/GMock.h>
 
 #include <folly/Optional.h>
 #include <proxygen/lib/http/HTTPHeaders.h>
@@ -39,8 +39,8 @@ class HasHTTPHeaderMatcherImpl :
   }
 
   bool MatchAndExplain(
-      HTTPHeaders& headers,
-      ::testing::MatchResultListener* listener) const override {
+      const HTTPHeaders& headers,
+      ::testing::MatchResultListener* /*listener*/) const override {
     bool matches = false;
     headers.forEach([&](const std::string& name, const std::string& value) {
         if (name_ != name) {

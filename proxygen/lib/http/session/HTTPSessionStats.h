@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -24,7 +24,9 @@ class HTTPSessionStats : public TTLBAStats {
   virtual void recordTransactionClosed() noexcept = 0;
   virtual void recordTransactionsServed(uint64_t) noexcept = 0;
   virtual void recordSessionReused() noexcept = 0;
-  virtual void recordSessionIdleTime(std::chrono::seconds) noexcept {};
+  virtual void recordSessionIdleTime(std::chrono::seconds) noexcept {}
+  virtual void recordTransactionStalled() noexcept = 0;
+  virtual void recordSessionStalled() noexcept = 0;
 };
 
 }

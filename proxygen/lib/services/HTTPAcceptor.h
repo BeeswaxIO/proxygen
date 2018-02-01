@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -40,8 +40,8 @@ class HTTPAcceptor : public wangle::Acceptor {
 
   void init(folly::AsyncServerSocket* serverSocket,
             folly::EventBase* eventBase,
-            wangle::SSLStats* stat=nullptr) override {
-    timer_ = folly::make_unique<WheelTimerInstance>(
+            wangle::SSLStats* /*stat*/ = nullptr) override {
+    timer_ = std::make_unique<WheelTimerInstance>(
         accConfig_.transactionIdleTimeout, eventBase);
     Acceptor::init(serverSocket, eventBase);
   }

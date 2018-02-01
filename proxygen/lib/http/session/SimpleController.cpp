@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -25,7 +25,7 @@ HTTPTransactionHandler* SimpleController::getRequestHandler(
 }
 
 HTTPTransactionHandler* SimpleController::getParseErrorHandler(
-    HTTPTransaction* txn,
+    HTTPTransaction* /*txn*/,
     const HTTPException& error,
     const folly::SocketAddress& localAddress) {
 
@@ -40,18 +40,15 @@ HTTPTransactionHandler* SimpleController::getParseErrorHandler(
 }
 
 HTTPTransactionHandler* SimpleController::getTransactionTimeoutHandler(
-    HTTPTransaction* txn,
-    const folly::SocketAddress& localAddress) {
+    HTTPTransaction* /*txn*/, const folly::SocketAddress& localAddress) {
 
   auto errorPage = acceptor_->getErrorPage(localAddress);
   return createErrorHandler(408, "Client timeout", errorPage);
 }
 
-void SimpleController::attachSession(HTTPSession* sess) {
-}
+void SimpleController::attachSession(HTTPSessionBase* /*sess*/) {}
 
-void SimpleController::detachSession(const HTTPSession* sess) {
-}
+void SimpleController::detachSession(const HTTPSessionBase* /*sess*/) {}
 
 HTTPTransactionHandler* SimpleController::createErrorHandler(
     uint32_t statusCode,

@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -56,7 +56,7 @@ class ZlibServerFilter : public Filter {
       Filter::sendHeaders(msg);
       header_ = true;
     } else {
-      responseMessage_ = folly::make_unique<HTTPMessage>(msg);
+      responseMessage_ = std::make_unique<HTTPMessage>(msg);
     }
   }
 
@@ -85,7 +85,7 @@ class ZlibServerFilter : public Filter {
 
     //First time through the compressor
     if (compressor_ == nullptr) {
-      compressor_ = folly::make_unique<ZlibStreamCompressor>(
+      compressor_ = std::make_unique<ZlibStreamCompressor>(
           proxygen::ZlibCompressionType::GZIP, compressionLevel_);
 
       if (!compressor_ || compressor_->hasError()) {
@@ -165,9 +165,7 @@ class ZlibServerFilter : public Filter {
 
     auto responseContentType =
         msg.getHeaders().getSingleOrEmpty(HTTP_HEADER_CONTENT_TYPE);
-
-    folly::toLowerAscii((char *)responseContentType.data(),
-        responseContentType.size());
+    folly::toLowerAscii(responseContentType);
 
     // Handle  text/html; encoding=utf-8 case
     auto parameter_idx = responseContentType.find(';');
@@ -206,7 +204,7 @@ class ZlibServerFilterFactory : public RequestHandlerFactory {
             std::make_shared<std::set<std::string>>(compressibleContentTypes)) {
   }
 
-  void onServerStart(folly::EventBase* evb) noexcept override {}
+  void onServerStart(folly::EventBase* /*evb*/) noexcept override {}
 
   void onServerStop() noexcept override {}
 

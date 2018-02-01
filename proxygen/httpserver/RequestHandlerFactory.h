@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -60,7 +60,7 @@ class RequestHandlerChain {
 
   template <typename T, typename... Args>
   RequestHandlerChain& addThen(Args&&... args) {
-    chain_.push_back(folly::make_unique<T>(std::forward<Args>(args)...));
+    chain_.push_back(std::make_unique<T>(std::forward<Args>(args)...));
     return *this;
   }
 

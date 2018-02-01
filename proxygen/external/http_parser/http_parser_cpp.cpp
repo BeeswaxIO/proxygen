@@ -191,9 +191,9 @@ static const char tokens[256] = {
 /*  24 can   25 em    26 sub   27 esc   28 fs    29 gs    30 rs    31 us  */
         0,       0,       0,       0,       0,       0,       0,       0,
 /*  32 sp    33  !    34  "    35  #    36  $    37  %    38  &    39  '  */
-       ' ',      '!',     '"',     '#',     '$',     '%',     '&',    '\'',
+        0,      '!',      0,     '#',     '$',     '%',     '&',    '\'',
 /*  40  (    41  )    42  *    43  +    44  ,    45  -    46  .    47  /  */
-        0,       0,      '*',     '+',      0,      '-',     '.',     '/',
+        0,       0,      '*',     '+',      0,      '-',     '.',      0,
 /*  48  0    49  1    50  2    51  3    52  4    53  5    54  6    55  7  */
        '0',     '1',     '2',     '3',     '4',     '5',     '6',     '7',
 /*  56  8    57  9    58  :    59  ;    60  <    61  =    62  >    63  ?  */
@@ -213,7 +213,7 @@ static const char tokens[256] = {
 /* 112  p   113  q   114  r   115  s   116  t   117  u   118  v   119  w  */
        'p',     'q',     'r',     's',     't',     'u',     'v',     'w',
 /* 120  x   121  y   122  z   123  {   124  |   125  }   126  ~   127 del */
-       'x',     'y',     'z',      0,      '|',     '}',     '~',       0 };
+       'x',     'y',     'z',      0,      '|',      0,     '~',       0 };
 
 
 static const int8_t unhex[256] =
@@ -1154,14 +1154,15 @@ size_t http_parser_execute (http_parser *parser,
           case CR:
             parser->http_major = 0;
             parser->http_minor = 9;
-            state = s_req_line_almost_done;
+            state = s_headers_almost_done;
             CALLBACK_DATA(url);
             break;
           case LF:
             parser->http_major = 0;
             parser->http_minor = 9;
-            state = s_header_field_start;
+            state = s_headers_almost_done;
             CALLBACK_DATA(url);
+            goto reexecute_byte;
             break;
           case '?':
             state = s_req_query_string_start;
@@ -1193,14 +1194,15 @@ size_t http_parser_execute (http_parser *parser,
           case CR:
             parser->http_major = 0;
             parser->http_minor = 9;
-            state = s_req_line_almost_done;
+            state = s_headers_almost_done;
             CALLBACK_DATA(url);
             break;
           case LF:
             parser->http_major = 0;
             parser->http_minor = 9;
-            state = s_header_field_start;
+            state = s_headers_almost_done;
             CALLBACK_DATA(url);
+            goto reexecute_byte;
             break;
           case '#':
             state = s_req_fragment_start;
@@ -1227,14 +1229,15 @@ size_t http_parser_execute (http_parser *parser,
           case CR:
             parser->http_major = 0;
             parser->http_minor = 9;
-            state = s_req_line_almost_done;
+            state = s_headers_almost_done;
             CALLBACK_DATA(url);
             break;
           case LF:
             parser->http_major = 0;
             parser->http_minor = 9;
-            state = s_header_field_start;
+            state = s_headers_almost_done;
             CALLBACK_DATA(url);
+            goto reexecute_byte;
             break;
           case '#':
             state = s_req_fragment_start;
@@ -1261,14 +1264,15 @@ size_t http_parser_execute (http_parser *parser,
           case CR:
             parser->http_major = 0;
             parser->http_minor = 9;
-            state = s_req_line_almost_done;
+            state = s_headers_almost_done;
             CALLBACK_DATA(url);
             break;
           case LF:
             parser->http_major = 0;
             parser->http_minor = 9;
-            state = s_header_field_start;
+            state = s_headers_almost_done;
             CALLBACK_DATA(url);
+            goto reexecute_byte;
             break;
           case '?':
             state = s_req_fragment;
@@ -1294,14 +1298,15 @@ size_t http_parser_execute (http_parser *parser,
           case CR:
             parser->http_major = 0;
             parser->http_minor = 9;
-            state = s_req_line_almost_done;
+            state = s_headers_almost_done;
             CALLBACK_DATA(url);
             break;
           case LF:
             parser->http_major = 0;
             parser->http_minor = 9;
-            state = s_header_field_start;
+            state = s_headers_almost_done;
             CALLBACK_DATA(url);
+            goto reexecute_byte;
             break;
           case '?':
           case '#':
@@ -1396,12 +1401,21 @@ size_t http_parser_execute (http_parser *parser,
       case s_req_http_minor:
       {
         if (ch == CR) {
-          state = s_req_line_almost_done;
+          if (parser->http_major== 0 && parser->http_minor == 9) {
+            state = s_headers_almost_done;
+          } else {
+            state = s_req_line_almost_done;
+          }
           break;
         }
 
         if (ch == LF) {
-          state = s_header_field_start;
+          if (parser->http_major == 0 && parser->http_minor == 9) {
+            state = s_headers_almost_done;
+            goto reexecute_byte;
+          } else {
+            state = s_header_field_start;
+          }
           break;
         }
 
@@ -1591,6 +1605,26 @@ size_t http_parser_execute (http_parser *parser,
         state = s_header_value;
         parser->index = 0;
 
+        // Error out if a content_length, transfer_encoding, or upgrade header
+        // was present with no actual value.  These headers correspond with
+        // special parser states that without the below accept empty header
+        // values and so we can reject such requests here in the parser.
+        // If more headers are added, can consider moving to a hash/map based
+        // model below.
+        if (ch == CR || ch == LF) {
+          if (parser->header_state == h_content_length) {
+            SET_ERRNO(HPE_INVALID_CONTENT_LENGTH);
+          } else if (parser->header_state == h_transfer_encoding) {
+            SET_ERRNO(HPE_INVALID_TRANSFER_ENCODING);
+          } else if (parser->header_state == h_upgrade) {
+            SET_ERRNO(HPE_INVALID_UPGRADE);
+          }
+
+          if (parser->http_errno != HPE_OK) {
+            goto error;
+          }
+        }
+
         if (ch == CR) {
           STRICT_CHECK(parser->quote != 0);
           parser->header_state = h_general;
@@ -1711,7 +1745,9 @@ size_t http_parser_execute (http_parser *parser,
             parser->header_state = h_general_and_quote;
             break;
 
-
+          // Not sure the below is relevant anymore as from
+          // s_header_value_start it appears as though we can never
+          // be in the situation below
           case h_transfer_encoding:
             SET_ERRNO(HPE_INVALID_HEADER_TOKEN);
             goto error;
@@ -1746,7 +1782,9 @@ size_t http_parser_execute (http_parser *parser,
             break;
 
           case h_transfer_encoding_chunked:
-            if (ch != ' ') parser->header_state = h_general;
+            if (ch != ' ') {
+              parser->header_state = h_general;
+            }
             break;
 
           default:
@@ -2134,6 +2172,8 @@ http_parser_init (http_parser *parser, enum http_parser_type t)
   parser->upgrade = 0;
   parser->flags = 0;
   parser->method = 0;
+  parser->http_major = 0;
+  parser->http_minor = 0;
   parser->http_errno = HPE_OK;
 }
 

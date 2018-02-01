@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -15,7 +15,7 @@
 namespace proxygen {
 
 /**
- * Handler that sends back a fixed response back.
+ * Handler that sends a fixed response back.
  */
 class DirectResponseHandler : public RequestHandler {
  public:
@@ -23,22 +23,19 @@ class DirectResponseHandler : public RequestHandler {
                         std::string message,
                         std::string body)
       : code_(code),
-        message_(message),
+        message_(std::move(message)),
         body_(folly::IOBuf::copyBuffer(body)) {
   }
 
-  void onRequest(std::unique_ptr<HTTPMessage> headers) noexcept override {
-  }
+  void onRequest(std::unique_ptr<HTTPMessage> /*headers*/) noexcept override {}
 
-  void onBody(std::unique_ptr<folly::IOBuf> body) noexcept override {
-  }
+  void onBody(std::unique_ptr<folly::IOBuf> /*body*/) noexcept override {}
 
-  void onUpgrade(proxygen::UpgradeProtocol prot) noexcept override {
-  }
+  void onUpgrade(proxygen::UpgradeProtocol /*prot*/) noexcept override {}
 
   void onEOM() noexcept override {
     ResponseBuilder(downstream_)
-        .status(code_, message_)
+        .status(code_, std::move(message_))
         .body(std::move(body_))
         .sendWithEOM();
   }
@@ -47,13 +44,11 @@ class DirectResponseHandler : public RequestHandler {
     delete this;
   }
 
-  void onError(ProxygenError err) noexcept override {
-    delete this;
-  }
+  void onError(ProxygenError /*err*/) noexcept override { delete this; }
 
  private:
   const int code_;
-  const std::string message_;
+  std::string message_;
   std::unique_ptr<folly::IOBuf> body_;
 };
 

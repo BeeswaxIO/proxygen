@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -45,7 +45,7 @@ BodyAllowed isRequestBodyAllowed(boost::optional<HTTPMethod> method) {
     return BodyAllowed::NOT_ALLOWED;
   }
   if (method == HTTPMethod::OPTIONS || method == HTTPMethod::POST ||
-      method == HTTPMethod::PUT || method == HTTPMethod::CONNECT) {
+      method == HTTPMethod::PUT) {
     return BodyAllowed::DEFINED;
   }
   return BodyAllowed::NOT_DEFINED;

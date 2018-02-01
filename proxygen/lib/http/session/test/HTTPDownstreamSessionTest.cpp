@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -7,17 +7,20 @@
  *  of patent rights can be found in the PATENTS file in the same directory.
  *
  */
+#include <string>
+#include <vector>
+
 #include <folly/Conv.h>
-#include <folly/Foreach.h>
+#include <folly/Range.h>
 #include <folly/futures/Promise.h>
-#include <wangle/acceptor/ConnectionManager.h>
 #include <folly/io/Cursor.h>
 #include <folly/io/async/EventBase.h>
 #include <folly/io/async/EventBaseManager.h>
 #include <folly/io/async/TimeoutManager.h>
-#include <gtest/gtest.h>
-#include <proxygen/lib/http/codec/test/TestUtils.h>
+#include <folly/io/async/test/MockAsyncTransport.h>
+#include <folly/portability/GTest.h>
 #include <proxygen/lib/http/codec/HTTPCodecFactory.h>
+#include <proxygen/lib/http/codec/test/TestUtils.h>
 #include <proxygen/lib/http/session/HTTPDirectResponseHandler.h>
 #include <proxygen/lib/http/session/HTTPDownstreamSession.h>
 #include <proxygen/lib/http/session/HTTPSession.h>
@@ -26,10 +29,7 @@
 #include <proxygen/lib/http/session/test/MockByteEventTracker.h>
 #include <proxygen/lib/http/session/test/TestUtils.h>
 #include <proxygen/lib/test/TestAsyncTransport.h>
-#include <string>
-#include <folly/io/async/test/MockAsyncTransport.h>
-#include <vector>
-
+#include <wangle/acceptor/ConnectionManager.h>
 
 using namespace folly::io;
 using namespace wangle;
@@ -51,32 +51,53 @@ class HTTPDownstreamTest : public testing::Test {
       flowControl_(flowControl) {
     EXPECT_CALL(mockController_, getGracefulShutdownTimeout())
       .WillRepeatedly(Return(std::chrono::milliseconds(0)));
-    EXPECT_CALL(mockController_, attachSession(_));
+    EXPECT_CALL(mockController_, attachSession(_))
+      .WillRepeatedly(Invoke([&] (HTTPSessionBase* session) {
+        session->setPrioritySampled(true);
+      }));
     HTTPSession::setDefaultReadBufferLimit(65536);
+    auto codec = makeServerCodec<typename C::Codec>(C::version);
+    rawCodec_ = codec.get();
+
+    // If the codec is H2, getHeaderIndexingStrategy will be called when setting
+    // up the codec
+    if (rawCodec_->getProtocol() == CodecProtocol::HTTP_2) {
+      EXPECT_CALL(mockController_, getHeaderIndexingStrategy())
+        .WillOnce(
+          Return(&testH2IndexingStrat_)
+      );
+    }
+
     httpSession_ = new HTTPDownstreamSession(
       transactionTimeouts_.get(),
       std::move(AsyncTransportWrapper::UniquePtr(transport_)),
       localAddr, peerAddr,
       &mockController_,
-      std::move(makeServerCodec<typename C::Codec>(
-                  C::version)),
-      mockTransportInfo /* no stats for now */);
+      std::move(codec),
+      mockTransportInfo /* no stats for now */,
+      nullptr);
     for (auto& param: flowControl) {
       if (param < 0) {
-        param = httpSession_->getCodec().getDefaultWindowSize();
+        param = rawCodec_->getDefaultWindowSize();
       }
     }
+
+    // Ensure the H2 header indexing strategy was setup correctly if applicable
+    if (rawCodec_->getProtocol() == CodecProtocol::HTTP_2) {
+      HTTP2Codec* recastedCodec = dynamic_cast<HTTP2Codec*>(rawCodec_);
+      EXPECT_EQ(
+        recastedCodec->getHeaderIndexingStrategy(), &testH2IndexingStrat_);
+    }
+
     httpSession_->setFlowControl(flowControl[0], flowControl[1],
                                  flowControl[2]);
+    httpSession_->setEgressSettings({{ SettingsId::MAX_CONCURRENT_STREAMS, 80 },
+                                     { SettingsId::HEADER_TABLE_SIZE, 5555 },
+                                     { SettingsId::ENABLE_PUSH, 1 }});
     httpSession_->startNow();
     clientCodec_ = makeClientCodec<typename C::Codec>(C::version);
     clientCodec_->generateConnectionPreface(requests_);
     clientCodec_->setCallback(&callbacks_);
-  }
-
-  typename C::Codec& getCodec() {
-    return
-      (typename C::Codec&)httpSession_->getCodecFilterChain().getChainEnd();
   }
 
   HTTPCodec::StreamID sendRequest(const std::string& url = "/",
@@ -119,14 +140,14 @@ class HTTPDownstreamTest : public testing::Test {
 
   void cleanup() {
     EXPECT_CALL(mockController_, detachSession(_));
-    httpSession_->shutdownTransportWithReset(kErrorConnectionReset);
+    httpSession_->dropConnection();
   }
 
 
   std::unique_ptr<testing::StrictMock<MockHTTPHandler>>
   addSimpleStrictHandler() {
     std::unique_ptr<testing::StrictMock<MockHTTPHandler>> handler =
-      folly::make_unique<testing::StrictMock<MockHTTPHandler>>();
+      std::make_unique<testing::StrictMock<MockHTTPHandler>>();
 
     // The ownership model here is suspect, but assume the callers won't destroy
     // handler before it's requested
@@ -144,7 +165,7 @@ class HTTPDownstreamTest : public testing::Test {
   std::unique_ptr<testing::NiceMock<MockHTTPHandler>>
   addSimpleNiceHandler() {
     std::unique_ptr<testing::NiceMock<MockHTTPHandler>> handler =
-      folly::make_unique<testing::NiceMock<MockHTTPHandler>>();
+      std::make_unique<testing::NiceMock<MockHTTPHandler>>();
 
     // See comment above
     auto rawHandler = handler.get();
@@ -262,10 +283,14 @@ class HTTPDownstreamTest : public testing::Test {
     clientCodec_ = HTTPCodecFactory::getCodec(expectedProtocol,
                                               TransportDirection::UPSTREAM);
   }
-
   void expectResponse(uint32_t code = 200,
                       ErrorCode errorCode = ErrorCode::NO_ERROR,
                       bool expect100 = false, bool expectGoaway = false) {
+    expectResponses(1, code, errorCode, expect100, expectGoaway);
+  }
+  void expectResponses(uint32_t n, uint32_t code = 200,
+                       ErrorCode errorCode = ErrorCode::NO_ERROR,
+                       bool expect100 = false, bool expectGoaway = false) {
     NiceMock<MockHTTPCodecCallback> callbacks;
     clientCodec_->setCallback(&callbacks);
     if (isParallelCodecProtocol(clientCodec_->getProtocol())) {
@@ -304,31 +329,33 @@ class HTTPDownstreamTest : public testing::Test {
                                       ErrorCode::NO_ERROR, _));
     }
 
-    uint8_t times = (expect100) ? 2 : 1;
-    EXPECT_CALL(callbacks, onMessageBegin(_, _))
-      .Times(times);
-    EXPECT_CALL(callbacks, onHeadersComplete(_, _))
-      .WillOnce(Invoke([code] (HTTPCodec::StreamID,
-                               std::shared_ptr<HTTPMessage> msg) {
-                         EXPECT_EQ(msg->getStatusCode(), code);
-                       }));
-    if (expect100) {
+    for (uint32_t i = 0; i < n; i++) {
+      uint8_t times = (expect100) ? 2 : 1;
+      EXPECT_CALL(callbacks, onMessageBegin(_, _))
+        .Times(times).RetiresOnSaturation();
       EXPECT_CALL(callbacks, onHeadersComplete(_, _))
-        .WillOnce(Invoke([] (HTTPCodec::StreamID,
-                             std::shared_ptr<HTTPMessage> msg) {
-                           EXPECT_EQ(msg->getStatusCode(), 100);
-                         }))
-        .RetiresOnSaturation();
-    }
-    if (errorCode != ErrorCode::NO_ERROR) {
-      EXPECT_CALL(callbacks, onAbort(_, _))
-        .WillOnce(Invoke([errorCode] (HTTPCodec::StreamID,
-                                      ErrorCode error) {
-                           EXPECT_EQ(error, errorCode);
+        .WillOnce(Invoke([code] (HTTPCodec::StreamID,
+                                 std::shared_ptr<HTTPMessage> msg) {
+                           EXPECT_EQ(msg->getStatusCode(), code);
                          }));
+      if (expect100) {
+        EXPECT_CALL(callbacks, onHeadersComplete(_, _))
+          .WillOnce(Invoke([] (HTTPCodec::StreamID,
+                               std::shared_ptr<HTTPMessage> msg) {
+                             EXPECT_EQ(msg->getStatusCode(), 100);
+                           }))
+          .RetiresOnSaturation();
+      }
+      if (errorCode != ErrorCode::NO_ERROR) {
+        EXPECT_CALL(callbacks, onAbort(_, _))
+          .WillOnce(Invoke([errorCode] (HTTPCodec::StreamID,
+                                        ErrorCode error) {
+                             EXPECT_EQ(error, errorCode);
+                         }));
+      }
+      EXPECT_CALL(callbacks, onBody(_, _, _)).RetiresOnSaturation();
+      EXPECT_CALL(callbacks, onMessageComplete(_, _)).RetiresOnSaturation();
     }
-    EXPECT_CALL(callbacks, onBody(_, _, _));
-    EXPECT_CALL(callbacks, onMessageComplete(_, _));
     parseOutput(*clientCodec_);
   }
 
@@ -363,6 +390,28 @@ class HTTPDownstreamTest : public testing::Test {
                              delay.count());
   }
 
+  MockByteEventTracker* setMockByteEventTracker() {
+    auto byteEventTracker = new MockByteEventTracker(nullptr);
+    httpSession_->setByteEventTracker(
+      std::unique_ptr<ByteEventTracker>(byteEventTracker));
+    EXPECT_CALL(*byteEventTracker, preSend(_, _, _))
+      .WillRepeatedly(Return(0));
+    EXPECT_CALL(*byteEventTracker, drainByteEvents())
+      .WillRepeatedly(Return(0));
+    EXPECT_CALL(*byteEventTracker, processByteEvents(_, _, _))
+      .WillRepeatedly(Invoke([byteEventTracker]
+                             (std::shared_ptr<ByteEventTracker> self,
+                              uint64_t bytesWritten,
+                              bool eor) {
+                               return self->ByteEventTracker::processByteEvents(
+                                 self,
+                                 bytesWritten,
+                                 eor);
+                             }));
+
+    return byteEventTracker;
+  }
+
  protected:
   EventBase eventBase_;
   TestAsyncTransport* transport_;  // invalid once httpSession_ is destroyed
@@ -375,6 +424,8 @@ class HTTPDownstreamTest : public testing::Test {
   NiceMock<MockHTTPCodecCallback> callbacks_;
   IOBufQueue parseOutputStream_{IOBufQueue::cacheChainLength()};
   bool breakParseOutput_{false};
+  typename C::Codec* rawCodec_{nullptr};
+  HeaderIndexingStrategy testH2IndexingStrat_;
 };
 
 // Uses TestAsyncTransport
@@ -689,9 +740,9 @@ TEST_F(HTTPDownstreamSessionTest, http_upgrade) {
 
   // Send the response in the new protocol after upgrade
   EXPECT_CALL(*handler, onUpgrade(_))
-    .WillOnce(Invoke([&handler] (UpgradeProtocol protocol) {
-          handler->sendReplyCode(100);
-        }));
+      .WillOnce(Invoke([&handler](UpgradeProtocol /*protocol*/) {
+        handler->sendReplyCode(100);
+      }));
 
   onEOMTerminateHandlerExpectShutdown(*handler);
 
@@ -740,7 +791,8 @@ TEST(HTTPDownstreamTest, parse_error_no_txn) {
     AsyncTransportWrapper::UniquePtr(transport),
     localAddr, peerAddr,
     &mockController, std::move(codec),
-    mockTransportInfo);
+    mockTransportInfo,
+    nullptr);
   session->startNow();
   HTTPException ex(HTTPException::Direction::INGRESS_AND_EGRESS, "foo");
   ex.setProxygenError(kErrorParseHeader);
@@ -748,7 +800,7 @@ TEST(HTTPDownstreamTest, parse_error_no_txn) {
   codecCallback->onError(HTTPCodec::StreamID(1), ex, true);
 
   // cleanup
-  session->shutdownTransportWithReset(kErrorConnectionReset);
+  session->dropConnection();
   evb.loop();
 }
 
@@ -768,7 +820,8 @@ TEST(HTTPDownstreamTest, byte_events_drained) {
     AsyncTransportWrapper::UniquePtr(transport),
     localAddr, peerAddr,
     &mockController, std::move(codec),
-    mockTransportInfo);
+    mockTransportInfo,
+    nullptr);
   session->setByteEventTracker(
       std::unique_ptr<ByteEventTracker>(byteEventTracker));
 
@@ -779,12 +832,130 @@ TEST(HTTPDownstreamTest, byte_events_drained) {
   // Byte events should be drained first
   EXPECT_CALL(*byteEventTracker, drainByteEvents())
     .Times(1);
-  EXPECT_CALL(*transport, closeWithReset())
+  EXPECT_CALL(*transport, closeNow())
     .Times(AtLeast(1));
 
   // Close the socket
-  session->shutdownTransportWithReset(kErrorConnectionReset);
+  session->dropConnection();
   evb.loop();
+}
+
+TEST_F(HTTPDownstreamSessionTest, http_with_ack_timing) {
+  // This is to test cases where holding a byte event to a finished HTTP/1.1
+  // transaction does not masquerade as HTTP pipelining.
+  auto byteEventTracker = setMockByteEventTracker();
+  InSequence enforceOrder;
+
+  auto handler1 = addSimpleStrictHandler();
+  handler1->expectHeaders();
+  handler1->expectEOM([&handler1] () {
+      handler1->sendChunkedReplyWithBody(200, 100, 100, false);
+    });
+  std::unique_ptr<HTTPTransaction::DestructorGuard> dg;
+  // Hold a dguard to first txn
+  EXPECT_CALL(*byteEventTracker, addLastByteEvent(_, _, _))
+      .WillOnce(Invoke([&dg](HTTPTransaction* txn,
+                             uint64_t /*byteNo*/,
+                             bool /*eorTrackingEnabled*/) {
+        dg.reset(new HTTPTransaction::DestructorGuard(txn));
+      }));
+  sendRequest();
+  flushRequestsAndLoop();
+  expectResponse();
+
+  // Send the secode request after receiving the first response (eg: clearly
+  // not pipelined)
+  auto handler2 = addSimpleStrictHandler();
+  handler2->expectHeaders();
+  handler2->expectEOM([&handler2] () {
+      handler2->sendChunkedReplyWithBody(200, 100, 100, false);
+    });
+  // This txn processed and destroyed before txn1
+  EXPECT_CALL(*byteEventTracker, addLastByteEvent(_, _, _));
+  handler2->expectDetachTransaction();
+
+  sendRequest();
+  flushRequestsAndLoop();
+  expectResponse();
+
+  // Now reset the dguard (simulate ack) and the first txn goes away too
+  handler1->expectDetachTransaction();
+  dg.reset();
+  gracefulShutdown();
+}
+
+TEST_F(HTTPDownstreamSessionTest, test_on_content_mismatch) {
+  // Test the behavior when the reported content-length on the header
+  // is different from the actual length of the body.
+  // The expectation is simply to log the behavior, such as:
+  // ".. HTTPTransaction.cpp ] Content-Length/body mismatch: expected: .. "
+  folly::EventBase base;
+  InSequence enforceOrder;
+  auto handler1 = addSimpleNiceHandler();
+  handler1->expectHeaders();
+  handler1->expectEOM([&handler1] () {
+        // over-estimate the content-length on the header
+        handler1->sendHeaders(200, 105);
+        handler1->sendBody(100);
+        handler1->txn_->sendEOM();
+      });
+  sendRequest();
+  flushRequestsAndLoop();
+
+  auto handler2 = addSimpleNiceHandler();
+  handler2->expectHeaders();
+  handler2->expectEOM([&handler2] () {
+        // under-estimate the content-length on the header
+        handler2->sendHeaders(200, 95);
+        handler2->sendBody(100);
+        handler2->txn_->sendEOM();
+      });
+  sendRequest();
+  flushRequestsAndLoop();
+  gracefulShutdown();
+}
+
+TEST_F(HTTPDownstreamSessionTest, http_with_ack_timing_pipeline) {
+  // Test a real pipelining case as well.  First request is done waiting for
+  // ack, then receive two pipelined requests.
+  auto byteEventTracker = setMockByteEventTracker();
+  InSequence enforceOrder;
+
+  auto handler1 = addSimpleStrictHandler();
+  handler1->expectHeaders();
+  handler1->expectEOM([&handler1] () {
+      handler1->sendChunkedReplyWithBody(200, 100, 100, false);
+    });
+  std::unique_ptr<HTTPTransaction::DestructorGuard> dg;
+  EXPECT_CALL(*byteEventTracker, addLastByteEvent(_, _, _))
+      .WillOnce(Invoke([&dg](HTTPTransaction* txn,
+                             uint64_t /*byteNo*/,
+                             bool /*eorTrackingEnabled*/) {
+        dg.reset(new HTTPTransaction::DestructorGuard(txn));
+      }));
+  sendRequest();
+  auto handler2 = addSimpleStrictHandler();
+  handler2->expectHeaders();
+  handler2->expectEOM([&handler2] () {
+      handler2->sendChunkedReplyWithBody(200, 100, 100, false);
+    });
+  EXPECT_CALL(*byteEventTracker, addLastByteEvent(_, _, _));
+  handler2->expectDetachTransaction();
+
+  sendRequest();
+  sendRequest();
+  auto handler3 = addSimpleStrictHandler();
+  handler3->expectHeaders();
+  handler3->expectEOM([&handler3] () {
+      handler3->sendChunkedReplyWithBody(200, 100, 100, false);
+    });
+  EXPECT_CALL(*byteEventTracker, addLastByteEvent(_, _, _));
+  handler3->expectDetachTransaction();
+  flushRequestsAndLoop();
+  expectResponses(3);
+  handler1->expectDetachTransaction();
+  dg.reset();
+  gracefulShutdown();
 }
 
 TEST_F(HTTP2DownstreamSessionTest, set_byte_event_tracker) {
@@ -812,10 +983,13 @@ TEST_F(HTTP2DownstreamSessionTest, set_byte_event_tracker) {
       transport_->resumeWrites();
     });
 
+  // Graceful shutdown will notify of GOAWAY
+  EXPECT_CALL(*handler1, onGoaway(ErrorCode::NO_ERROR));
+  EXPECT_CALL(*handler2, onGoaway(ErrorCode::NO_ERROR));
   // The original byteEventTracker will process the last byte event of the
   // first transaction, and detach by deleting the event.  Swap out the tracker.
   handler1->expectDetachTransaction([this] {
-      auto tracker = folly::make_unique<ByteEventTracker>(httpSession_);
+      auto tracker = std::make_unique<ByteEventTracker>(httpSession_);
       httpSession_->setByteEventTracker(std::move(tracker));
     });
   // handler2 should also be detached immediately because the new
@@ -823,6 +997,34 @@ TEST_F(HTTP2DownstreamSessionTest, set_byte_event_tracker) {
   handler2->expectDetachTransaction();
   gracefulShutdown();
 }
+
+TEST_F(HTTPDownstreamSessionTest, test_tracked_byte_event_tracker) {
+  auto byteEventTracker = setMockByteEventTracker();
+  InSequence enforceOrder;
+
+  auto handler1 = addSimpleStrictHandler();
+  size_t bytesToSend = 200;
+  size_t expectedTrackedByteOffset = bytesToSend + 99;
+  handler1->expectHeaders();
+  handler1->expectEOM([&handler1, &bytesToSend] () {
+    handler1->sendHeaders(200, 200);
+    handler1->sendBodyWithLastByteTracking(bytesToSend);
+    handler1->txn_->sendEOM();
+    });
+
+  std::unique_ptr<HTTPTransaction::DestructorGuard> dg;
+  EXPECT_CALL(*byteEventTracker,
+    addTrackedByteEvent(_, expectedTrackedByteOffset))
+      .WillOnce(Invoke([&dg](HTTPTransaction* txn,
+                             uint64_t /*byteNo*/) {
+        dg.reset(new HTTPTransaction::DestructorGuard(txn));
+      }));
+  sendRequest();
+  handler1->expectDetachTransaction();
+  dg.reset();
+  gracefulShutdown();
+}
+
 
 TEST_F(HTTPDownstreamSessionTest, trailers) {
   testChunks(true);
@@ -1131,7 +1333,7 @@ TEST_F(SPDY3DownstreamSessionTest, spdy_rate_limit_rst) {
 }
 
 // Send a 1.0 request, egress the EOM with the last body chunk on a paused
-// socket, and let it timeout.  shutdownTransportWithReset will result in a call
+// socket, and let it timeout.  dropConnection()
 // to removeTransaction with writesDraining_=true
 TEST_F(HTTPDownstreamSessionTest, write_timeout) {
   HTTPMessage req = getGetRequest();
@@ -1179,6 +1381,9 @@ TEST_F(HTTPDownstreamSessionTest, write_timeout_pipeline) {
           handler1->txn_->sendEOM();
         }, 50);
     });
+  auto handler2 = addSimpleNiceHandler();
+  handler2->expectHeaders();
+  handler2->expectEOM();
   handler1->expectError([&] (const HTTPException& ex) {
       ASSERT_EQ(ex.getProxygenError(), kErrorWriteTimeout);
       ASSERT_EQ(folly::to<std::string>("WriteTimeout on transaction id: ",
@@ -1186,6 +1391,14 @@ TEST_F(HTTPDownstreamSessionTest, write_timeout_pipeline) {
                 std::string(ex.what()));
       handler1->txn_->sendAbort();
     });
+  handler2->expectError([&] (const HTTPException& ex) {
+      ASSERT_EQ(ex.getProxygenError(), kErrorWriteTimeout);
+      ASSERT_EQ(folly::to<std::string>("WriteTimeout on transaction id: ",
+                                       handler2->txn_->getID()),
+                std::string(ex.what()));
+      handler2->txn_->sendAbort();
+    });
+  handler2->expectDetachTransaction();
   handler1->expectDetachTransaction();
   expectDetachSession();
 
@@ -1325,25 +1538,45 @@ void HTTPDownstreamTest<C>::testSimpleUpgrade(
   const std::string& upgradeHeader,
   CodecProtocol expectedProtocol,
   const std::string& expectedUpgradeHeader) {
-  this->getCodec().setAllowedUpgradeProtocols({expectedUpgradeHeader});
+  this->rawCodec_->setAllowedUpgradeProtocols({expectedUpgradeHeader});
 
   auto handler = addSimpleStrictHandler();
 
+  HeaderIndexingStrategy testH2IndexingStrat;
   handler->expectHeaders();
   EXPECT_CALL(mockController_, onSessionCodecChange(httpSession_));
-  handler->expectEOM([&handler, expectedUpgradeHeader] {
+  handler->expectEOM(
+    [&handler, expectedProtocol, expectedUpgradeHeader, &testH2IndexingStrat] {
       EXPECT_FALSE(handler->txn_->getSetupTransportInfo().secure);
-      EXPECT_EQ(*handler->txn_->getSetupTransportInfo().sslNextProtocol,
+      EXPECT_EQ(*handler->txn_->getSetupTransportInfo().appProtocol,
                 expectedUpgradeHeader);
+      if (expectedProtocol == CodecProtocol::HTTP_2) {
+        const HTTP2Codec* codec = dynamic_cast<const HTTP2Codec*>(
+          &handler->txn_->getTransport().getCodec());
+        ASSERT_NE(codec, nullptr);
+        EXPECT_EQ(codec->getHeaderIndexingStrategy(), &testH2IndexingStrat);
+      }
       handler->sendReplyWithBody(200, 100);
     });
   handler->expectDetachTransaction();
 
-  sendRequest(getUpgradeRequest(upgradeHeader));
+  if (expectedProtocol == CodecProtocol::HTTP_2) {
+    EXPECT_CALL(mockController_, getHeaderIndexingStrategy())
+      .WillOnce(
+        Return(&testH2IndexingStrat)
+    );
+  }
+
+  HTTPMessage req = getUpgradeRequest(upgradeHeader);
+  if (upgradeHeader == http2::kProtocolCleartextString) {
+    HTTP2Codec::requestUpgrade(req);
+  }
+  sendRequest(req);
   flushRequestsAndLoop();
 
   expect101(expectedProtocol, expectedUpgradeHeader);
   expectResponse();
+
   gracefulShutdown();
 }
 
@@ -1396,7 +1629,7 @@ TEST_F(HTTPDownstreamSessionTest, http_upgrade_native_junk) {
 
 // Attempt to upgrade on second txn
 TEST_F(HTTPDownstreamSessionTest, http_upgrade_native_txn_2) {
-  this->getCodec().setAllowedUpgradeProtocols({"spdy/3"});
+  this->rawCodec_->setAllowedUpgradeProtocols({"spdy/3"});
   auto handler1 = addSimpleStrictHandler();
   handler1->expectHeaders();
   handler1->expectEOM([&handler1] {
@@ -1422,7 +1655,7 @@ TEST_F(HTTPDownstreamSessionTest, http_upgrade_native_txn_2) {
 
 // Upgrade on POST
 TEST_F(HTTPDownstreamSessionTest, http_upgrade_native_post) {
-  this->getCodec().setAllowedUpgradeProtocols({"spdy/3"});
+  this->rawCodec_->setAllowedUpgradeProtocols({"spdy/3"});
   auto handler = addSimpleStrictHandler();
   handler->expectHeaders();
   handler->expectBody();
@@ -1445,7 +1678,7 @@ TEST_F(HTTPDownstreamSessionTest, http_upgrade_native_post) {
 
 // Upgrade on POST with a reply that comes before EOM, don't switch protocols
 TEST_F(HTTPDownstreamSessionTest, http_upgrade_native_post_early_resp) {
-  this->getCodec().setAllowedUpgradeProtocols({"spdy/3"});
+  this->rawCodec_->setAllowedUpgradeProtocols({"spdy/3"});
   auto handler = addSimpleStrictHandler();
   handler->expectHeaders([&handler] {
       handler->sendReplyWithBody(200, 100);
@@ -1463,10 +1696,32 @@ TEST_F(HTTPDownstreamSessionTest, http_upgrade_native_post_early_resp) {
   gracefulShutdown();
 }
 
+TEST_F(HTTPDownstreamSessionTest, http_upgrade_native_post_early_partial_resp) {
+  this->rawCodec_->setAllowedUpgradeProtocols({"spdy/3"});
+  auto handler = addSimpleStrictHandler();
+  handler->expectHeaders([&handler] {
+      handler->sendHeaders(200, 100);
+    });
+  handler->expectBody();
+  handler->expectEOM([&handler] {
+      handler->sendBody(100);
+      handler->txn_->sendEOM();
+    });
+  handler->expectDetachTransaction();
+
+  HTTPMessage req = getUpgradeRequest("spdy/3", HTTPMethod::POST, 10);
+  auto streamID = sendRequest(req, false);
+  clientCodec_->generateBody(requests_, streamID, makeBuf(10),
+                             boost::none, true);
+  flushRequestsAndLoop();
+  expectResponse();
+  gracefulShutdown();
+}
+
 // Upgrade but with a pipelined HTTP request.  It is parsed as SPDY and
 // rejected
 TEST_F(HTTPDownstreamSessionTest, http_upgrade_native_extra) {
-  this->getCodec().setAllowedUpgradeProtocols({"spdy/3"});
+  this->rawCodec_->setAllowedUpgradeProtocols({"spdy/3"});
   auto handler = addSimpleStrictHandler();
   handler->expectHeaders();
   EXPECT_CALL(mockController_, onSessionCodecChange(httpSession_));
@@ -1492,7 +1747,7 @@ TEST_F(HTTPDownstreamSessionTest, http_upgrade_native_extra) {
 // before sending the POST.  But if the 101 is delayed beyond EOM, the 101
 // will come via SPDY.
 TEST_F(HTTPDownstreamSessionTest, http_upgrade_native_post_100) {
-  this->getCodec().setAllowedUpgradeProtocols({"spdy/3"});
+  this->rawCodec_->setAllowedUpgradeProtocols({"spdy/3"});
   auto handler = addSimpleStrictHandler();
   handler->expectHeaders([&handler] {
       handler->sendHeaders(100, 0);
@@ -1516,7 +1771,7 @@ TEST_F(HTTPDownstreamSessionTest, http_upgrade_native_post_100) {
 }
 
 TEST_F(HTTPDownstreamSessionTest, http_upgrade_native_post_100_late) {
-  this->getCodec().setAllowedUpgradeProtocols({"spdy/3"});
+  this->rawCodec_->setAllowedUpgradeProtocols({"spdy/3"});
   auto handler = addSimpleStrictHandler();
   handler->expectHeaders();
   handler->expectBody();
@@ -1549,15 +1804,22 @@ TEST_F(SPDY3DownstreamSessionTest, spdy_prio) {
 // the request that was an upgrade.  The reply GOAWAY should have last good
 // stream = 1, not 0.
 TEST_F(HTTPDownstreamSessionTest, http_upgrade_goaway_drain) {
-  this->getCodec().setAllowedUpgradeProtocols({"h2c"});
+  this->rawCodec_->setAllowedUpgradeProtocols({"h2c"});
   auto handler = addSimpleStrictHandler();
   handler->expectHeaders();
   handler->expectBody();
   EXPECT_CALL(mockController_, onSessionCodecChange(httpSession_));
   handler->expectEOM();
+  handler->expectGoaway();
   handler->expectDetachTransaction();
 
+  EXPECT_CALL(mockController_, getHeaderIndexingStrategy())
+    .WillOnce(
+      Return(&testH2IndexingStrat_)
+  );
+
   HTTPMessage req = getUpgradeRequest("h2c", HTTPMethod::POST, 10);
+  HTTP2Codec::requestUpgrade(req);
   auto streamID = sendRequest(req, false);
   clientCodec_->generateBody(requests_, streamID, makeBuf(10),
                              boost::none, true);
@@ -1610,10 +1872,10 @@ void HTTPDownstreamTest<C>::testPriorities(uint32_t numPriorities) {
     .Times(iterations * numPriorities);
   // body is variable and hence ignored
   EXPECT_CALL(callbacks_, onMessageComplete(_, _))
-    .Times(iterations * numPriorities)
-    .WillRepeatedly(Invoke([&] (HTTPCodec::StreamID stream, bool upgrade) {
-          streams.push_back(stream);
-        }));
+      .Times(iterations * numPriorities)
+      .WillRepeatedly(Invoke([&](HTTPCodec::StreamID stream, bool /*upgrade*/) {
+        streams.push_back(stream);
+      }));
 
   parseOutput(*clientCodec_);
 
@@ -1716,10 +1978,12 @@ TYPED_TEST_P(HTTPDownstreamTest, testWritesDraining) {
   auto handler1 = this->addSimpleNiceHandler();
   handler1->expectHeaders();
   handler1->expectEOM();
-  handler1->expectError([&] (const HTTPException& ex) {
-      ASSERT_EQ(ex.getProxygenError(), kErrorEOF);
-      ASSERT_EQ("Shutdown transport: EOF", std::string(ex.what()));
-    });
+  handler1->expectError([&](const HTTPException& ex) {
+    ASSERT_EQ(ex.getProxygenError(), kErrorEOF);
+    ASSERT_TRUE(
+        folly::StringPiece(ex.what()).startsWith("Shutdown transport: EOF"))
+        << ex.what();
+  });
   handler1->expectDetachTransaction();
 
   this->flushRequestsAndLoop();
@@ -1784,10 +2048,10 @@ TYPED_TEST_P(HTTPDownstreamTest, testUniformPauseState) {
   auto handler2 = this->addSimpleStrictHandler();
   handler2->expectHeaders();
   handler2->expectEOM([&] {
-      handler1->sendHeaders(200, 24000);
+      handler1->sendHeaders(200, 24002);
       // triggers pause of all txns
       this->transport_->pauseWrites();
-      handler1->txn_->sendBody(std::move(makeBuf(12000)));
+      handler1->txn_->sendBody(std::move(makeBuf(12001)));
       this->resumeWritesAfterDelay(milliseconds(50));
     });
   handler1->expectEgressPaused();
@@ -1799,7 +2063,7 @@ TYPED_TEST_P(HTTPDownstreamTest, testUniformPauseState) {
 
   handler1->expectEgressResumed([&] {
       // resume does not trigger another pause,
-      handler1->txn_->sendBody(std::move(makeBuf(12000)));
+      handler1->txn_->sendBody(std::move(makeBuf(12001)));
     });
   // handler2 gets a fair shot, handler3 is not resumed
   // HTTP/2 priority is not implemented, so handler3 is like another 0 pri txn
@@ -1811,8 +2075,8 @@ TYPED_TEST_P(HTTPDownstreamTest, testUniformPauseState) {
 
   handler1->expectEgressResumed();
   handler2->expectEgressResumed([&] {
-      handler2->sendHeaders(200, 12000);
-      handler2->txn_->sendBody(std::move(makeBuf(12000)));
+      handler2->sendHeaders(200, 12001);
+      handler2->txn_->sendBody(std::move(makeBuf(12001)));
       this->transport_->pauseWrites();
       this->resumeWritesAfterDelay(milliseconds(50));
     });
@@ -1844,7 +2108,7 @@ TYPED_TEST_P(HTTPDownstreamTest, testUniformPauseState) {
 // Test exceeding the MAX_CONCURRENT_STREAMS setting.  The txn should get
 // REFUSED_STREAM, and other streams can complete normally
 TYPED_TEST_P(HTTPDownstreamTest, testMaxTxns) {
-  auto settings = this->httpSession_->getCodec().getEgressSettings();
+  auto settings = this->rawCodec_->getEgressSettings();
   auto maxTxns = settings->getSetting(SettingsId::MAX_CONCURRENT_STREAMS,
                                       100);
   std::list<unique_ptr<StrictMock<MockHTTPHandler>>> handlers;
@@ -1860,6 +2124,10 @@ TYPED_TEST_P(HTTPDownstreamTest, testMaxTxns) {
     auto streamID = this->sendRequest();
     this->clientCodec_->generateGoaway(this->requests_, 0, ErrorCode::NO_ERROR);
 
+    for (auto& handler: handlers) {
+      EXPECT_CALL(*handler, onGoaway(ErrorCode::NO_ERROR));
+    }
+
     this->flushRequestsAndLoop();
 
     EXPECT_CALL(this->callbacks_, onSettings(_));
@@ -1868,7 +2136,7 @@ TYPED_TEST_P(HTTPDownstreamTest, testMaxTxns) {
     this->parseOutput(*this->clientCodec_);
   }
   // handlers can finish out of order?
-  for (auto &handler: handlers) {
+  for (auto& handler: handlers) {
     handler->sendReplyWithBody(200, 100);
     handler->expectDetachTransaction();
   }
@@ -1888,8 +2156,8 @@ TEST_F(SPDY3DownstreamSessionTest, spdy_max_concurrent_streams) {
   sendRequest(req);
   auto req2p = sendRequestLater(req, true);
 
-  httpSession_->getCodecFilterChain()->getEgressSettings()->setSetting(
-    SettingsId::MAX_CONCURRENT_STREAMS, 1);
+  httpSession_->setEgressSettings({{
+        SettingsId::MAX_CONCURRENT_STREAMS, 1}});
 
   InSequence handlerSequence;
   auto handler1 = addSimpleStrictHandler();
@@ -1975,7 +2243,7 @@ TEST_F(SPDY31DownstreamTest, testEOFOnBlockedSession) {
   handler1->expectHeaders();
   handler1->expectEOM([&handler1, this] {
       handler1->sendHeaders(200, 40000);
-      handler1->sendBody(32768);
+      handler1->sendBody(32769);
     });
   auto handler2 = addSimpleStrictHandler();
   handler2->expectHeaders();
@@ -2059,9 +2327,9 @@ TEST_F(SPDY3DownstreamSessionTest, new_txn_egress_paused) {
     .Times(2);
   // body is variable and hence ignored;
   EXPECT_CALL(callbacks_, onMessageComplete(_, _))
-    .WillRepeatedly(Invoke([&] (HTTPCodec::StreamID stream, bool upgrade) {
-          streams.push_back(stream);
-        }));
+      .WillRepeatedly(Invoke([&](HTTPCodec::StreamID stream, bool /*upgrade*/) {
+        streams.push_back(stream);
+      }));
   parseOutput(*clientCodec_);
 
   cleanup();
@@ -2132,7 +2400,7 @@ TEST_F(HTTP2DownstreamSessionTest, padding_flow_control) {
 TEST_F(HTTP2DownstreamSessionTest, graceful_drain_on_timeout) {
   InSequence handlerSequence;
   std::chrono::milliseconds gracefulTimeout(200);
-  getCodec().enableDoubleGoawayDrain();
+  httpSession_->enableDoubleGoawayDrain();
   EXPECT_CALL(mockController_, getGracefulShutdownTimeout())
     .WillOnce(InvokeWithoutArgs([&] {
           // Once session asks for graceful shutdown timeout, expect the client
@@ -2205,12 +2473,15 @@ TEST_F(HTTP2DownstreamSessionTest, server_push) {
       auto* pushTxn = handler->txn_->newPushedTransaction(&pushHandler);
       ASSERT_NE(pushTxn, nullptr);
       // Generate a push request (PUSH_PROMISE)
+      auto outgoingStreams = httpSession_->getNumOutgoingStreams();
       pushTxn->sendHeaders(req);
+      EXPECT_EQ(httpSession_->getNumOutgoingStreams(), outgoingStreams);
       // Generate a push response
       auto pri = handler->txn_->getPriority();
       res.setHTTP2Priority(std::make_tuple(pri.streamDependency,
                                            pri.exclusive, pri.weight));
       pushTxn->sendHeaders(res);
+      EXPECT_EQ(httpSession_->getNumOutgoingStreams(), outgoingStreams + 1);
       pushTxn->sendBody(makeBuf(200));
       pushTxn->sendEOM();
 
@@ -2344,12 +2615,174 @@ TEST_F(HTTP2DownstreamSessionTest, test_priority_weights_tiny_ratio) {
       handler4->sendReplyWithBody(200, 1);
     });
 
-  handler1->expectDetachTransaction();
-  handler3->expectDetachTransaction();
+  handler1->expectDetachTransaction([&] {
+      HTTPTransaction::PrioritySampleSummary summary;
+      EXPECT_EQ(handler1->txn_->getPrioritySampleSummary(summary), true);
+      EXPECT_EQ(handler1->txn_->getTransport().getHTTP2PrioritiesEnabled(),
+                true);
+      // id1 had no egress when id2 was running, so id1 was contending only with
+      // id3 and id4. Average number of contentions for id1 is 3
+      EXPECT_EQ(summary.contentions_.byTransactionBytes_, 3);
+      EXPECT_EQ(summary.contentions_.bySessionBytes_, 3);
+      // this is a first level transaction, depth == 1
+      EXPECT_EQ(summary.depth_.byTransactionBytes_, 1);
+      EXPECT_EQ(summary.depth_.bySessionBytes_, 1);
+      // the expected relative weight is 256/257 ~= 0.9961
+      EXPECT_GT(summary.expected_weight_, 0.996);
+      EXPECT_LT(summary.expected_weight_, 0.9962);
+      // the measured relative weight is 4096/(4096+15) ~= 0.99635
+      // This value is higher than the expected relative weight of 0.9961.
+      // Due to the arithmetical rounding to the lowest integer, the measured
+      // relative weight tends to be higher for transactions with high relative
+      // weights and lower for transactions with the low relative weights.
+      EXPECT_GT(summary.measured_weight_, 0.9963);
+      EXPECT_LT(summary.measured_weight_, 0.9964);
+    });
+  handler3->expectDetachTransaction([&] {
+      HTTPTransaction::PrioritySampleSummary summary;
+      EXPECT_EQ(handler3->txn_->getPrioritySampleSummary(summary), true);
+      EXPECT_EQ(handler3->txn_->getTransport().getHTTP2PrioritiesEnabled(),
+                true);
+      // Similarly, id3 was contenting with id1 and id4
+      // Average number of contentions for id3 is 3
+      EXPECT_EQ(summary.contentions_.byTransactionBytes_, 3);
+      EXPECT_EQ(summary.contentions_.bySessionBytes_, 3);
+      // this is a second level transaction where parent has
+      // no egress, depth == 2
+      EXPECT_EQ(summary.depth_.byTransactionBytes_, 2);
+      EXPECT_EQ(summary.depth_.bySessionBytes_, 2);
+      // the expected relative weight should be
+      // 1/257 * 256/257 ~= 0.00388. However, in the calculation of the
+      // allowed bytes to send we rounding to the lowest positive integer.
+      // Therefore, the measured relative weight tends to be less than
+      // it should be.  In this example, the allowed bytes sent is
+      // 4096 * 0.00388 ~= 15.89, which is rounded to 15. Hence the measured
+      // relative weight is 15/(4096+15) ~= 0.00365
+      EXPECT_GT(summary.expected_weight_, 0.00388);
+      EXPECT_LT(summary.expected_weight_, 0.0039);
+      EXPECT_GT(summary.measured_weight_, 0.00364);
+      EXPECT_LT(summary.measured_weight_, 0.00366);
+    });
   handler4->expectDetachTransaction([&] {
+      HTTPTransaction::PrioritySampleSummary summary;
+      EXPECT_EQ(handler4->txn_->getPrioritySampleSummary(summary), true);
+      EXPECT_EQ(handler4->txn_->getTransport().getHTTP2PrioritiesEnabled(),
+                true);
+      // This is the priority-based blocking situation. id4 was blocked by
+      // higher priority transactions id1 and id3. Only when id1 and id3
+      // finished, id4 had a chance to transfer its data.
+      // Average contention number weighted by transaction bytes is 1, which
+      // means that when id4 had a chance to transfer bytes it did not contend
+      // with any other transactions.
+      // id4 was waiting for id1 and id3 during transfer of 4256 bytes (encoded)
+      // after which it tranferred 10 bytes (encoded) without contention.
+      // Therefore, the average number contentions weighted by session bytes is
+      // (4111*3 + 1*1)/(4111 + 1) = 12334/4112 ~= 2.999
+      // The difference in average contentions weighted by transaction and
+      // session bytes tells that id4 was mostly blocked by rather than blocking
+      // other transactions.
+      EXPECT_EQ(summary.contentions_.byTransactionBytes_, 1);
+      EXPECT_GT(summary.contentions_.bySessionBytes_, 2.99);
+      EXPECT_LT(summary.contentions_.bySessionBytes_, 3.00);
+      // this is a second level transaction where parent has
+      // no egress, depth == 2
+      EXPECT_EQ(summary.depth_.byTransactionBytes_, 2);
+      EXPECT_EQ(summary.depth_.bySessionBytes_, 2);
+      // the expected relative weight should be
+      // 1/257 * 1/257 ~= 0.000015.
+      // Because no bytes of this transaction were sent during the previous
+      // egress, the expected relative weight was calculated as:
+      // (0*4111 + 1*1)/(4111 + 1) ~= 0.000243
+      EXPECT_GT(summary.expected_weight_, 0.000243);
+      EXPECT_LT(summary.expected_weight_, 0.000244);
+      // The measured weight is (0+1)/(4111+1)  ~= 0.000243
+      // The difference between the theoretical value of 0.000015 and the
+      // measured one is not because of the arithmetical rounding, but because
+      // all other transactions are completed and the relative waight for the
+      // only survived transaction was elevated to 1.0
+      EXPECT_GT(summary.measured_weight_, 0.000243);
+      EXPECT_LT(summary.measured_weight_, 0.000244);
       handler2->txn_->sendAbort();
     });
   handler2->expectDetachTransaction();
+  flushRequestsAndLoop();
+  httpSession_->closeWhenIdle();
+  expectDetachSession();
+  eventBase_.loop();
+}
+
+TEST_F(HTTP2DownstreamSessionTest, test_priority_dependent_transactions) {
+  // Create a dependent transaction to test the priority blocked by dependency.
+  // ratio*4096 < 1.
+  //
+  //     root
+  //      \                                                 level 1
+  //      16
+  //       \                                                level 2
+  //       16
+  InSequence enforceOrder;
+  auto req1 = getGetRequest();
+  req1.setHTTP2Priority(HTTPMessage::HTTPPriority{0, false, 15});
+  auto id1 = sendRequest(req1);
+
+  auto req2 = getGetRequest();
+  req2.setHTTP2Priority(HTTPMessage::HTTPPriority{id1, false, 15});
+  sendRequest(req2);
+
+  auto handler1 = addSimpleStrictHandler();
+  handler1->expectHeaders();
+  handler1->expectEOM([&] {
+      handler1->sendReplyWithBody(200, 1024);
+    });
+  auto handler2 = addSimpleStrictHandler();
+  handler2->expectHeaders();
+  handler2->expectEOM([&] {
+      handler2->sendReplyWithBody(200, 1024);
+    });
+
+  handler1->expectDetachTransaction([&] {
+      HTTPTransaction::PrioritySampleSummary summary;
+      EXPECT_EQ(handler1->txn_->getPrioritySampleSummary(summary), true);
+      EXPECT_EQ(handler1->txn_->getTransport().getHTTP2PrioritiesEnabled(),
+                true);
+      // id1 is contending with id2 during the entire transfer.
+      // Average number of contentions for id1 is 2 in both cases.
+      // The same number of average contentions weighted by both transaction
+      // and session bytes tells that id1 was not blocked by any other
+      // transaction during the entire transfer.
+      EXPECT_EQ(summary.contentions_.byTransactionBytes_, 2);
+      EXPECT_EQ(summary.contentions_.bySessionBytes_, 2);
+      // this is a first level transaction, depth == 1
+      EXPECT_EQ(summary.depth_.byTransactionBytes_, 1);
+      EXPECT_EQ(summary.depth_.bySessionBytes_, 1);
+      // dependent transaction is blocked, the parent is egressing on 100%
+      EXPECT_EQ(summary.expected_weight_, 1);
+      EXPECT_EQ(summary.measured_weight_, 1);
+    });
+  handler2->expectDetachTransaction([&] {
+      HTTPTransaction::PrioritySampleSummary summary;
+      EXPECT_EQ(handler2->txn_->getPrioritySampleSummary(summary), true);
+      EXPECT_EQ(handler2->txn_->getTransport().getHTTP2PrioritiesEnabled(),
+                true);
+      // This is the dependency-based blocking. id2 is blocked by id1.
+      // When id2 had a chance to transfer bytes, it was no longer contended
+      // with any other transaction. Hence the average contention weighted by
+      // transaction bytes is 1.
+      // The average number of contentions weighted by the session bytes is
+      // computed as (1024*2 + 1024*1)/(1024 + 1024) = 3072/2048 = 1.5
+      EXPECT_EQ(summary.contentions_.byTransactionBytes_, 1);
+      EXPECT_EQ(summary.contentions_.bySessionBytes_, 1.5);
+      // The transaction transferred bytes only when its parent transaction
+      // completed. At that time its level decreased to 1. The average depth
+      // weighted by session bytes is (2*1024 + 1*1024)/(2048) = 1.5.
+      EXPECT_EQ(summary.depth_.byTransactionBytes_, 1);
+      EXPECT_EQ(summary.depth_.bySessionBytes_, 1.5);
+      // this dependent transaction was bloted, so it was egressiong only 1/2
+      // of the session bytes.
+      EXPECT_EQ(summary.expected_weight_, 0.5);
+      EXPECT_EQ(summary.measured_weight_, 0.5);
+      handler2->txn_->sendAbort();
+    });
   flushRequestsAndLoop();
   httpSession_->closeWhenIdle();
   expectDetachSession();
@@ -2418,7 +2851,6 @@ TEST_F(HTTP2DownstreamSessionTest, continuation_timeout) {
 }
 
 TEST_F(HTTP2DownstreamSessionTest, test_priority_weights) {
-  InSequence enforceOrder;
   // virtual priority node with pri=4
   auto priGroupID = clientCodec_->createStream();
   clientCodec_->generatePriority(
@@ -2556,13 +2988,13 @@ TEST_F(HTTP2DownstreamSessionTest, test_priority_weights_tiny_window) {
 }
 
 TEST_F(HTTP2DownstreamSessionTest, test_short_content_length) {
-  InSequence enforceOrder;
   auto req = getPostRequest(10);
   auto streamID = sendRequest(req, false);
   clientCodec_->generateBody(requests_, streamID, makeBuf(20),
                              boost::none, true);
   auto handler1 = addSimpleStrictHandler();
 
+  InSequence enforceOrder;
   handler1->expectHeaders();
   handler1->expectError([&handler1] (const HTTPException& ex) {
       EXPECT_EQ(ex.getProxygenError(), kErrorParseBody);
@@ -2579,7 +3011,6 @@ TEST_F(HTTP2DownstreamSessionTest, test_short_content_length) {
  * detachTransaction shouldn't be expected
  */
 TEST_F(HTTP2DownstreamSessionTest, test_bad_content_length_untie_handler) {
-  InSequence enforceOrder;
   auto req = getPostRequest(10);
   auto streamID = sendRequest(req, false);
   clientCodec_->generateBody(
@@ -2590,6 +3021,7 @@ TEST_F(HTTP2DownstreamSessionTest, test_bad_content_length_untie_handler) {
       true);
   auto handler1 = addSimpleStrictHandler();
 
+  InSequence enforceOrder;
   handler1->expectHeaders();
   handler1->expectError([&] (const HTTPException&) {
       if (handler1->txn_) {
@@ -2603,13 +3035,13 @@ TEST_F(HTTP2DownstreamSessionTest, test_bad_content_length_untie_handler) {
 }
 
 TEST_F(HTTP2DownstreamSessionTest, test_long_content_length) {
-  InSequence enforceOrder;
   auto req = getPostRequest(30);
   auto streamID = sendRequest(req, false);
   clientCodec_->generateBody(requests_, streamID, makeBuf(20),
                              boost::none, true);
   auto handler1 = addSimpleStrictHandler();
 
+  InSequence enforceOrder;
   handler1->expectHeaders();
   handler1->expectBody();
   handler1->expectError([&handler1] (const HTTPException& ex) {
@@ -2623,7 +3055,6 @@ TEST_F(HTTP2DownstreamSessionTest, test_long_content_length) {
 }
 
 TEST_F(HTTP2DownstreamSessionTest, test_malformed_content_length) {
-  InSequence enforceOrder;
   auto req = getPostRequest();
   req.getHeaders().set(HTTP_HEADER_CONTENT_LENGTH, "malformed");
   auto streamID = sendRequest(req, false);
@@ -2631,6 +3062,7 @@ TEST_F(HTTP2DownstreamSessionTest, test_malformed_content_length) {
                              boost::none, true);
   auto handler1 = addSimpleStrictHandler();
 
+  InSequence enforceOrder;
   handler1->expectHeaders();
   handler1->expectBody();
   handler1->expectEOM([&handler1] {
@@ -2704,4 +3136,141 @@ TEST_F(HTTPDownstreamSessionTest, http_short_content_length) {
   expectDetachSession();
   flushRequestsAndLoop();
 
+}
+
+TEST_F(HTTP2DownstreamSessionTest, test_session_stall_by_flow_control) {
+  NiceMock<MockHTTPSessionStats> stats;
+  // By default the send and receive windows are 64K each.
+  // If we use only a single transaction, that transaction
+  // will be paused on reaching 64K. Therefore, to pause the session,
+  // it is used 2 transactions each sending 32K.
+
+  // Make write buffer limit exceding 64K, for example 128K
+  httpSession_->setWriteBufferLimit(128 * 1024);
+  httpSession_->setSessionStats(&stats);
+
+  InSequence enforceOrder;
+  sendRequest();
+  sendRequest();
+
+  auto handler1 = addSimpleStrictHandler();
+
+  handler1->expectHeaders();
+  handler1->expectEOM([&] {
+      handler1->sendReplyWithBody(200, 32 * 1024);
+    });
+
+  auto handler2 = addSimpleStrictHandler();
+  handler2->expectHeaders();
+  handler2->expectEOM([&] {
+      handler2->sendReplyWithBody(200, 32 * 1024);
+    });
+
+  EXPECT_CALL(stats, recordSessionStalled()).Times(1);
+
+  handler1->expectDetachTransaction();
+
+  // twice- once to send and once to receive
+  flushRequestsAndLoopN(2);
+
+  // open the window
+  clientCodec_->generateWindowUpdate(requests_, 0, 100);
+  handler2->expectDetachTransaction();
+  flushRequestsAndLoopN(2);
+
+  httpSession_->closeWhenIdle();
+  expectDetachSession();
+  flushRequestsAndLoop();
+}
+
+TEST_F(HTTP2DownstreamSessionTest, test_transaction_stall_by_flow_control) {
+  StrictMock<MockHTTPSessionStats> stats;
+
+  httpSession_->setSessionStats(&stats);
+
+  // Set the client side stream level flow control wind to 500 bytes,
+  // and try to send 1000 bytes through it.
+  // Then the flow control kicks in and stalls the transaction.
+  clientCodec_->getEgressSettings()->setSetting(SettingsId::INITIAL_WINDOW_SIZE,
+                                                500);
+  clientCodec_->generateSettings(requests_);
+
+  auto streamID = sendRequest();
+
+  EXPECT_CALL(stats, recordTransactionOpened());
+
+  InSequence handlerSequence;
+  auto handler = addSimpleStrictHandler();
+  handler->expectHeaders();
+  handler->expectEOM([&] {
+      handler->sendReplyWithBody(200, 1000);
+    });
+
+  EXPECT_CALL(stats, recordTransactionStalled());
+  handler->expectEgressPaused();
+
+  handler->expectError([&] (const HTTPException& ex) {
+      ASSERT_EQ(ex.getProxygenError(), kErrorWriteTimeout);
+      ASSERT_EQ(
+        folly::to<std::string>("ingress timeout, streamID=", streamID),
+        std::string(ex.what()));
+      handler->terminate();
+    });
+
+  handler->expectDetachTransaction();
+
+  EXPECT_CALL(stats, recordTransactionClosed());
+
+  flushRequestsAndLoop();
+  gracefulShutdown();
+}
+
+TEST_F(HTTP2DownstreamSessionTest, test_transaction_not_stall_by_flow_control) {
+  StrictMock<MockHTTPSessionStats> stats;
+
+  httpSession_->setSessionStats(&stats);
+
+  clientCodec_->getEgressSettings()->setSetting(SettingsId::INITIAL_WINDOW_SIZE,
+                                                500);
+  clientCodec_->generateSettings(requests_);
+
+  sendRequest();
+
+  EXPECT_CALL(stats, recordTransactionOpened());
+
+  InSequence handlerSequence;
+  auto handler = addSimpleStrictHandler();
+  handler->expectHeaders();
+  handler->expectEOM([&] {
+      handler->sendReplyWithBody(200, 500);
+    });
+
+  // The egtress paused is notified due to existing logics,
+  // but egress transaction should not be counted as stalled by flow control,
+  // because there is nore more bytes to send
+  handler->expectEgressPaused();
+
+  handler->expectDetachTransaction();
+
+  EXPECT_CALL(stats, recordTransactionClosed());
+
+  flushRequestsAndLoop();
+  gracefulShutdown();
+}
+
+TEST_F(HTTP2DownstreamSessionTest, test_set_egress_settings) {
+  SettingsList settings = {{ SettingsId::HEADER_TABLE_SIZE, 5555 },
+                           { SettingsId::MAX_FRAME_SIZE, 16384 },
+                           { SettingsId::ENABLE_PUSH, 1 }};
+
+  const HTTPSettings* codecSettings = rawCodec_->getEgressSettings();
+  for (const auto& setting: settings) {
+    const HTTPSetting* currSetting = codecSettings->getSetting(setting.id);
+    if (currSetting) {
+      EXPECT_EQ(setting.value, currSetting->value);
+    }
+  }
+
+  flushRequestsAndLoop();
+  gracefulShutdown();
 }

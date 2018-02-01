@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -27,7 +27,7 @@ class HTTPSessionStats;
  */
 class HTTPSessionAcceptor:
   public HTTPAcceptor,
-  private HTTPSession::InfoCallback {
+  private HTTPSessionBase::InfoCallback {
 public:
   explicit HTTPSessionAcceptor(const AcceptorConfiguration& accConfig);
   explicit HTTPSessionAcceptor(const AcceptorConfiguration& accConfig,
@@ -81,6 +81,13 @@ public:
   }
 
   /**
+   * return the codec factory for this session
+   */
+  std::shared_ptr<HTTPCodecFactory> getCodecFactory() {
+    return codecFactory_;
+  }
+
+  /**
    * Create a Handler for a new transaction.  The transaction and HTTP message
    * (request) are passed so the implementation can construct different
    * handlers based on these.  The transaction will be explicitly set on the
@@ -111,6 +118,10 @@ protected:
 
   HTTPSessionStats* downstreamSessionStats_{nullptr};
 
+  HTTPSession::InfoCallback* getSessionInfoCallback() {
+    return sessionInfoCb_ ? sessionInfoCb_ : this;
+  }
+
   // Acceptor methods
   void onNewConnection(
     folly::AsyncTransportWrapper::UniquePtr sock,
@@ -127,35 +138,11 @@ protected:
 
   virtual size_t dropIdleConnections(size_t num);
 
-  virtual void onSessionCreationError(ProxygenError error) {}
+  virtual void onSessionCreationError(ProxygenError /*error*/) {}
 
-private:
+ private:
   HTTPSessionAcceptor(const HTTPSessionAcceptor&) = delete;
   HTTPSessionAcceptor& operator=(const HTTPSessionAcceptor&) = delete;
-
-  // HTTPSession::InfoCallback methods
-  void onCreate(const HTTPSession&) override {}
-  void onIngressError(const HTTPSession&, ProxygenError error) override {}
-  void onIngressEOF() override {}
-  void onRead(const HTTPSession&, size_t bytesRead) override {}
-  void onWrite(const HTTPSession&, size_t bytesWritten) override {}
-  void onRequestBegin(const HTTPSession&) override {}
-  void onRequestEnd(const HTTPSession&,
-                    uint32_t maxIngressQueueSize) override {}
-  void onActivateConnection(const HTTPSession&) override {}
-  void onDeactivateConnection(const HTTPSession&) override {}
-  void onDestroy(const HTTPSession&) override {}
-  void onIngressMessage(const HTTPSession&, const HTTPMessage&) override {}
-  void onIngressLimitExceeded(const HTTPSession&) override {}
-  void onIngressPaused(const HTTPSession&) override {}
-  void onTransactionDetached(const HTTPSession&) override {}
-  void onPingReplySent(int64_t latency) override {}
-  void onPingReplyReceived() override {}
-  void onSettingsOutgoingStreamsFull(const HTTPSession&) override {}
-  void onSettingsOutgoingStreamsNotFull(const HTTPSession&) override {}
-  void onFlowControlWindowClosed(const HTTPSession&) override {}
-  void onEgressBuffered(const HTTPSession&) override {}
-  void onEgressBufferCleared(const HTTPSession&) override {}
 
   /** General-case error page generator */
   std::unique_ptr<HTTPErrorPage> defaultErrorPage_;

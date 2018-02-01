@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -99,7 +99,7 @@ void PushRequestHandler::onEOM() noexcept {
     .sendWithEOM();
 }
 
-void PushRequestHandler::onUpgrade(UpgradeProtocol protocol) noexcept {
+void PushRequestHandler::onUpgrade(UpgradeProtocol /*protocol*/) noexcept {
   // handler doesn't support upgrades
 }
 
@@ -107,7 +107,7 @@ void PushRequestHandler::requestComplete() noexcept {
   delete this;
 }
 
-void PushRequestHandler::onError(ProxygenError err) noexcept {
+void PushRequestHandler::onError(ProxygenError /*err*/) noexcept {
   delete this;
 }
 

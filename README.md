@@ -1,5 +1,7 @@
 ## Proxygen: Facebook's C++ HTTP Libraries
 
+[![Build Status](https://travis-ci.org/facebook/proxygen.svg?branch=master)](https://travis-ci.org/facebook/proxygen)
+
 This project comprises the core C++ HTTP abstractions used at
 Facebook. Internally, it is used as the basis for building many HTTP
 servers, proxies, and clients. This release focuses on the common HTTP
@@ -19,7 +21,7 @@ Note that currently this project has only been tested on Ubuntu 14.04,
 although it likely works on many other platforms. Support for Mac OSX is
 incomplete.
 
-You will need at least 2 GiB of memory to compile `proxygen` and its
+You will need at least 3 GiB of memory to compile `proxygen` and its
 dependencies.
 
 ##### Easy Install
@@ -104,7 +106,7 @@ server. Try `cd`ing to the directory containing the echo server at
 liner:
 
 <code>
-g++ -std=c++11 -o my_echo EchoServer.cpp EchoHandler.cpp -lproxygenhttpserver -lfolly -lglog -lgflags -pthread
+g++ -std=c++14 -o my_echo EchoServer.cpp EchoHandler.cpp -lproxygenhttpserver -lfolly -lglog -lgflags -pthread
 </code>
 
 After running `./my_echo`, we can verify it works using curl in a different terminal:

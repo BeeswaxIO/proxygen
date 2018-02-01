@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -9,7 +9,7 @@
  */
 #include <proxygen/lib/http/codec/HTTP2Framer.h>
 
-#include <cstdint>
+#include <folly/tracing/ScopedTraceSection.h>
 
 using namespace folly::io;
 using namespace folly;
@@ -66,7 +66,8 @@ size_t writeFrameHeader(IOBufQueue& queue,
                         uint32_t stream,
                         boost::optional<uint8_t> padding,
                         boost::optional<PriorityUpdate> priority,
-                        std::unique_ptr<IOBuf> payload) noexcept {
+                        std::unique_ptr<IOBuf> payload,
+                        bool reuseIOBufHeadroom = true) noexcept {
   size_t headerSize = kFrameHeaderSize;
 
   // the acceptable length is now conditional based on state :(
@@ -100,7 +101,7 @@ size_t writeFrameHeader(IOBufQueue& queue,
     ((kLengthMask & length) << 8) | static_cast<uint8_t>(type);
 
   uint64_t payloadLength = 0;
-  if (payload && !payload->isSharedOne() &&
+  if (reuseIOBufHeadroom && payload && !payload->isSharedOne() &&
       payload->headroom() >= headerSize &&
       queue.tailroom() < headerSize) {
     // Use the headroom in payload for the frame header.
@@ -226,6 +227,7 @@ bool frameHasPadding(const FrameHeader& header) {
 ErrorCode
 parseFrameHeader(Cursor& cursor,
                  FrameHeader& header) noexcept {
+  FOLLY_SCOPED_TRACE_SECTION("HTTP2Framer - parseFrameHeader");
   DCHECK_LE(kFrameHeaderSize, cursor.totalLength());
 
   // MUST ignore the 2 bits before the length
@@ -261,11 +263,10 @@ parseData(Cursor& cursor,
   return skipPadding(cursor, padding, kStrictPadding);
 }
 
-ErrorCode
-parseDataBegin(Cursor& cursor,
-               FrameHeader header,
-               size_t& parsed,
-               uint16_t& outPadding) noexcept {
+ErrorCode parseDataBegin(Cursor& cursor,
+                         FrameHeader header,
+                         size_t& /*parsed*/,
+                         uint16_t& outPadding) noexcept {
   uint8_t padding = 0;
   const auto err = http2::parsePadding(cursor, header, padding);
   RETURN_IF_ERROR(err);
@@ -513,7 +514,8 @@ writeData(IOBufQueue& queue,
           std::unique_ptr<IOBuf> data,
           uint32_t stream,
           boost::optional<uint8_t> padding,
-          bool endStream) noexcept {
+          bool endStream,
+          bool reuseIOBufHeadroom) noexcept {
   DCHECK_NE(0, stream);
   uint8_t flags = 0;
   if (endStream) {
@@ -529,7 +531,8 @@ writeData(IOBufQueue& queue,
                                          stream,
                                          padding,
                                          boost::none,
-                                         std::move(data));
+                                         std::move(data),
+                                         reuseIOBufHeadroom);
   writePadding(queue, padding);
   return kFrameHeaderSize + frameLen;
 }

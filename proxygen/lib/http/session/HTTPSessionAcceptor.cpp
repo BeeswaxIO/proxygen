@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -33,7 +33,8 @@ HTTPSessionAcceptor::HTTPSessionAcceptor(
     codecFactory_(codecFactory),
     simpleController_(this) {
   if (!codecFactory_) {
-    codecFactory_ = std::make_shared<HTTPDefaultSessionCodecFactory>(accConfig);
+    codecFactory_ =
+        std::make_shared<HTTPDefaultSessionCodecFactory>(accConfig_);
   }
 }
 
@@ -55,11 +56,11 @@ const HTTPErrorPage* HTTPSessionAcceptor::getErrorPage(
 }
 
 void HTTPSessionAcceptor::onNewConnection(
-  folly::AsyncTransportWrapper::UniquePtr sock,
-  const SocketAddress* peerAddress,
-  const string& nextProtocol,
-  wangle::SecureTransportType secureTransportType,
-  const wangle::TransportInfo& tinfo) {
+    folly::AsyncTransportWrapper::UniquePtr sock,
+    const SocketAddress* peerAddress,
+    const string& nextProtocol,
+    wangle::SecureTransportType /*secureTransportType*/,
+    const wangle::TransportInfo& tinfo) {
 
   unique_ptr<HTTPCodec> codec
       = codecFactory_->getCodec(nextProtocol, TransportDirection::DOWNSTREAM);
@@ -78,6 +79,17 @@ void HTTPSessionAcceptor::onNewConnection(
     VLOG(3) << "couldn't get local address for socket";
     localAddress = unknownSocketAddress_;
   }
+
+  // overwrite address if the socket has no IP, e.g. Unix domain socket
+  if (!localAddress.isFamilyInet()) {
+    if (accConfig_.bindAddress.isFamilyInet()) {
+      localAddress = accConfig_.bindAddress;
+    } else {
+      localAddress = unknownSocketAddress_;
+    }
+    VLOG(4) << "set localAddress=" << localAddress.describe();
+  }
+
   auto sessionInfoCb = sessionInfoCb_ ? sessionInfoCb_ : this;
   VLOG(4) << "Created new session for peer " << *peerAddress;
   HTTPDownstreamSession* session =
@@ -89,6 +101,7 @@ void HTTPSessionAcceptor::onNewConnection(
     session->setMaxConcurrentIncomingStreams(
         accConfig_.maxConcurrentIncomingStreams);
   }
+  session->setEgressSettings(accConfig_.egressSettings);
 
   // set HTTP2 priorities flag on session object
   session->setHTTP2PrioritiesEnabled(accConfig_.HTTP2PrioritiesEnabled);

@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -9,7 +9,7 @@
  */
 #include <folly/io/Cursor.h>
 #include <folly/io/IOBuf.h>
-#include <gtest/gtest.h>
+#include <folly/portability/GTest.h>
 #include <memory>
 #include <proxygen/lib/http/codec/compress/HPACKDecodeBuffer.h>
 #include <proxygen/lib/http/codec/compress/HPACKEncodeBuffer.h>
@@ -32,7 +32,7 @@ class HPACKBufferTests : public testing::Test {
    * a queue with one IOBuf of 512 bytes in it
    */
   HPACKBufferTests() : encoder_(512),
-                       decoder_(huffman::reqHuffTree05(), cursor_, 0,
+                       decoder_(huffman::huffTree(), cursor_, 0,
                                 kMaxLiteralSize) {
   }
 
@@ -109,13 +109,13 @@ TEST_F(HPACKBufferTests, encode_plain_literal) {
 
 TEST_F(HPACKBufferTests, encode_huffman_literal) {
   string accept("accept-encoding");
-  HPACKEncodeBuffer encoder(512, huffman::reqHuffTree05(), true);
+  HPACKEncodeBuffer encoder(512, huffman::huffTree(), true);
   uint32_t size = encoder.encodeLiteral(accept);
-  EXPECT_EQ(size, 11);
+  EXPECT_EQ(size, 12);
   releaseData(encoder);
-  EXPECT_EQ(buf_->length(), 11);
-  EXPECT_EQ(data_[0], 138); // 128(huffman bit) + 10(length)
-  EXPECT_EQ(data_[10], 47);
+  EXPECT_EQ(buf_->length(), 12);
+  EXPECT_EQ(data_[0], 139); // 128(huffman bit) + 11(length)
+  EXPECT_EQ(data_[11], 0x7f);
 }
 
 TEST_F(HPACKBufferTests, decode_single_byte) {
@@ -209,7 +209,7 @@ TEST_F(HPACKBufferTests, decode_literal_error) {
   wdata[0] = 255; // size
   wdata[1] = 'a';
   wdata[2] = 'b';
-  string literal;
+  folly::fbstring literal;
   CHECK_EQ(decoder_.decodeLiteral(literal), DecodeError::BUFFER_UNDERFLOW);
 
   resetDecoder();
@@ -243,7 +243,7 @@ TEST_F(HPACKBufferTests, decode_literal_multi_buffer) {
   buf1->appendChain(std::move(buf2));
   // decode
   resetDecoder(buf1.get());
-  string literal;
+  folly::fbstring literal;
   EXPECT_EQ(decoder_.decodeLiteral(literal), DecodeError::NONE);
   EXPECT_EQ(literal.size(), size);
   EXPECT_EQ(literal[0], 'x');
@@ -252,7 +252,7 @@ TEST_F(HPACKBufferTests, decode_literal_multi_buffer) {
 
 TEST_F(HPACKBufferTests, decode_huffman_literal_multi_buffer) {
   // "gzip" fits perfectly in a 3 bytes block
-  uint8_t gzip[3] = {203, 213, 78};
+  uint8_t gzip[3] = {0x9b, 0xd9, 0xab};
   auto buf1 = IOBuf::create(128);
   auto buf2 = IOBuf::create(128);
   // total size
@@ -280,7 +280,7 @@ TEST_F(HPACKBufferTests, decode_huffman_literal_multi_buffer) {
   buf1->appendChain(std::move(buf2));
   // decode
   resetDecoder(buf1.get());
-  string literal;
+  folly::fbstring literal;
   EXPECT_EQ(decoder_.decodeLiteral(literal), DecodeError::NONE);
   EXPECT_EQ(literal.size(), 4 * (size / 3));
   EXPECT_EQ(literal.find("gzip"), 0);
@@ -290,7 +290,7 @@ TEST_F(HPACKBufferTests, decode_huffman_literal_multi_buffer) {
 TEST_F(HPACKBufferTests, decode_plain_literal) {
   buf_ = IOBuf::create(512);
   std::string gzip("gzip");
-  std::string literal;
+  folly::fbstring literal;
   uint8_t* wdata = buf_->writableData();
 
   buf_->append(1 + gzip.size());
@@ -386,15 +386,15 @@ TEST_F(HPACKBufferTests, empty_iobuf_literal) {
   first->writableData()[0] = 0x80;
 
   HPACKEncodeBuffer encoder(128); // no huffman
-  string literal("randomheadervalue");
+  folly::fbstring literal("randomheadervalue");
   encoder.encodeLiteral(literal);
   first->appendChain(encoder.release());
 
   uint32_t size = first->next()->length();
   Cursor cursor(first.get());
-  HPACKDecodeBuffer decoder(huffman::reqHuffTree05(), cursor, size,
+  HPACKDecodeBuffer decoder(huffman::huffTree(), cursor, size,
                             kMaxLiteralSize);
-  string decoded;
+  folly::fbstring decoded;
   decoder.decodeLiteral(decoded);
 
   EXPECT_EQ(literal, decoded);
@@ -411,7 +411,7 @@ TEST_F(HPACKBufferTests, large_literal_error) {
   EXPECT_TRUE(encoder_.encodeLiteral(largeLiteral));
   releaseData();
   resetDecoder();
-  string decoded = "";
+  folly::fbstring decoded = "";
   EXPECT_EQ(decoder_.decodeLiteral(decoded), DecodeError::LITERAL_TOO_LARGE);
   EXPECT_EQ(decoded.size(), 0);
 }

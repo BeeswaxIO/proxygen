@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -9,6 +9,7 @@
  */
 #pragma once
 
+#include <folly/FBString.h>
 #include <folly/io/Cursor.h>
 #include <folly/io/IOBuf.h>
 #include <proxygen/lib/http/codec/compress/HPACKConstants.h>
@@ -21,8 +22,7 @@ const uint32_t kTableSize = 256;
 
 // not used explicitly, since the prefixes are all 1's and they are
 // used only for padding of up to 7 bits
-const uint32_t kEOSReqHpack05 = 0x3ffffdc;
-const uint32_t kEOSRespHpack05 = 0xffffdd;
+const uint32_t kEOSHpack = 0x3fffffff;
 
 /**
  * node from the huffman tree
@@ -100,7 +100,8 @@ class HuffTree {
    *
    * @return true if the decode process was successful
    */
-  bool decode(const uint8_t* buf, uint32_t size, std::string& literal) const;
+  bool decode(const uint8_t* buf, uint32_t size,
+              folly::fbstring& literal) const;
 
   /**
    * encode string literal into huffman encoded bit stream
@@ -108,7 +109,7 @@ class HuffTree {
    * @param literal string to encode
    * @param buf where to append the encoded binary data
    */
-  uint32_t encode(const std::string& literal,
+  uint32_t encode(const folly::fbstring& literal,
                   folly::io::QueueAppender& buf) const;
 
   /**
@@ -118,7 +119,7 @@ class HuffTree {
    * @param literal string literal
    * @return size how many bytes it will take to encode the given string
    */
-  uint32_t getEncodeSize(const std::string& literal) const;
+  uint32_t getEncodeSize(const folly::fbstring& literal) const;
 
   /**
    * get the binary representation for a given character, as a 32-bit word and
@@ -151,8 +152,6 @@ class HuffTree {
   SuperHuffNode table_[46];
 };
 
-// accessors for static huffman trees from the draft-05 version of HPACK
-const HuffTree& reqHuffTree05();
-const HuffTree& respHuffTree05();
+const HuffTree& huffTree();
 
 }}

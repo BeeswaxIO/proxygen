@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -9,8 +9,9 @@
  */
 #pragma once
 
-#include <gmock/gmock.h>
+#include <folly/portability/GMock.h>
 #include <proxygen/lib/http/HTTPMessage.h>
+#include <proxygen/lib/http/session/HTTPSessionStats.h>
 #include <proxygen/lib/http/session/HTTPDownstreamSession.h>
 #include <proxygen/lib/http/session/HTTPSessionController.h>
 #include <proxygen/lib/http/session/HTTPTransaction.h>
@@ -74,6 +75,11 @@ class HTTPHandlerBase {
       txn_->sendBody(folly::IOBuf::copyBuffer(buf, toSend));
       content_length -= toSend;
     }
+  }
+
+  void sendBodyWithLastByteTracking(uint32_t content_length) {
+    txn_->setLastByteFlushedTrackingEnabled(true);
+    sendBody(content_length);
   }
 
   void sendReplyWithBody(uint32_t code, uint32_t content_length,
@@ -152,6 +158,8 @@ class MockHTTPHandler : public HTTPHandlerBase,
 
   GMOCK_NOEXCEPT_METHOD1(onError, void(const HTTPException& error));
 
+  GMOCK_NOEXCEPT_METHOD1(onGoaway, void(ErrorCode));
+
   GMOCK_NOEXCEPT_METHOD0(onEgressPaused, void());
 
   GMOCK_NOEXCEPT_METHOD0(onEgressResumed, void());
@@ -186,6 +194,15 @@ class MockHTTPHandler : public HTTPHandlerBase,
       .RetiresOnSaturation();
   }
 
+  void expectChunkHeader(std::function<void()> callback = std::function<void()>()) {
+    if (callback) {
+      EXPECT_CALL(*this, onChunkHeader(testing::_))
+        .WillOnce(testing::InvokeWithoutArgs(callback));
+    } else {
+      EXPECT_CALL(*this, onChunkHeader(testing::_));
+    }
+  }
+
   void expectBody(std::function<void()> callback = std::function<void()>()) {
     if (callback) {
       EXPECT_CALL(*this, onBody(testing::_))
@@ -198,6 +215,15 @@ class MockHTTPHandler : public HTTPHandlerBase,
   void expectBody(std::function<void(std::shared_ptr<folly::IOBuf>)> callback) {
     EXPECT_CALL(*this, onBody(testing::_))
       .WillOnce(testing::Invoke(callback));
+  }
+
+  void expectChunkComplete(std::function<void()> callback = std::function<void()>()) {
+    if (callback) {
+      EXPECT_CALL(*this, onChunkComplete())
+        .WillOnce(testing::InvokeWithoutArgs(callback));
+    } else {
+      EXPECT_CALL(*this, onChunkComplete());
+    }
   }
 
   void expectEOM(std::function<void()> callback = std::function<void()>()) {
@@ -239,6 +265,16 @@ class MockHTTPHandler : public HTTPHandlerBase,
     }
   }
 
+  void expectGoaway(std::function<void(ErrorCode)> callback =
+                    std::function<void(ErrorCode)>()) {
+    if (callback) {
+      EXPECT_CALL(*this, onGoaway(testing::_))
+        .WillOnce(testing::Invoke(callback));
+    } else {
+      EXPECT_CALL(*this, onGoaway(testing::_));
+    }
+  }
+
   void expectDetachTransaction(
     std::function<void()> callback = std::function<void()>()) {
     if (callback) {
@@ -264,6 +300,8 @@ class MockHTTPPushHandler : public HTTPHandlerBase,
   GMOCK_NOEXCEPT_METHOD0(detachTransaction, void());
 
   GMOCK_NOEXCEPT_METHOD1(onError, void(const HTTPException& error));
+
+  GMOCK_NOEXCEPT_METHOD1(onGoaway, void(ErrorCode));
 
   GMOCK_NOEXCEPT_METHOD0(onEgressPaused, void());
 
@@ -298,17 +336,23 @@ class MockController : public HTTPSessionController {
       HTTPTransaction* txn,
       const folly::SocketAddress&));
 
-  MOCK_METHOD1(attachSession, void(HTTPSession*));
-  MOCK_METHOD1(detachSession, void(const HTTPSession*));
-  MOCK_METHOD1(onSessionCodecChange, void(HTTPSession*));
+  MOCK_METHOD1(attachSession, void(HTTPSessionBase*));
+  MOCK_METHOD1(detachSession, void(const HTTPSessionBase*));
+  MOCK_METHOD1(onSessionCodecChange, void(HTTPSessionBase*));
   MOCK_CONST_METHOD0(getGracefulShutdownTimeout, std::chrono::milliseconds());
+
+  MOCK_CONST_METHOD0(
+    getHeaderIndexingStrategy, const HeaderIndexingStrategy*());
 };
 
 class MockUpstreamController : public HTTPUpstreamSessionController {
  public:
-  MOCK_METHOD1(attachSession, void(HTTPSession*));
-  MOCK_METHOD1(detachSession, void(const HTTPSession*));
-  MOCK_METHOD1(onSessionCodecChange, void(HTTPSession*));
+  MOCK_METHOD1(attachSession, void(HTTPSessionBase*));
+  MOCK_METHOD1(detachSession, void(const HTTPSessionBase*));
+  MOCK_METHOD1(onSessionCodecChange, void(HTTPSessionBase*));
+
+  MOCK_CONST_METHOD0(
+    getHeaderIndexingStrategy, const HeaderIndexingStrategy*());
 };
 
 ACTION_P(ExpectString, expected) {
@@ -322,29 +366,62 @@ ACTION_P(ExpectBodyLen, expectedLen) {
 
 class MockHTTPSessionInfoCallback: public HTTPSession::InfoCallback {
  public:
-  MOCK_METHOD1(onCreate, void(const HTTPSession&));
-  MOCK_METHOD2(onIngressError, void(const HTTPSession&,
+  MOCK_METHOD1(onCreate, void(const HTTPSessionBase&));
+  MOCK_METHOD2(onIngressError, void(const HTTPSessionBase&,
                                     ProxygenError));
   MOCK_METHOD0(onIngressEOF, void());
-  MOCK_METHOD2(onRead, void(const HTTPSession&, size_t));
-  MOCK_METHOD2(onWrite, void(const HTTPSession&, size_t));
-  MOCK_METHOD1(onRequestBegin, void(const HTTPSession&));
-  MOCK_METHOD2(onRequestEnd, void(const HTTPSession&, uint32_t));
-  MOCK_METHOD1(onActivateConnection, void(const HTTPSession&));
-  MOCK_METHOD1(onDeactivateConnection, void(const HTTPSession&));
-  MOCK_METHOD1(onDestroy, void(const HTTPSession&));
-  MOCK_METHOD2(onIngressMessage, void(const HTTPSession&,
+  MOCK_METHOD2(onRead, void(const HTTPSessionBase&, size_t));
+  MOCK_METHOD2(onWrite, void(const HTTPSessionBase&, size_t));
+  MOCK_METHOD1(onRequestBegin, void(const HTTPSessionBase&));
+  MOCK_METHOD2(onRequestEnd, void(const HTTPSessionBase&, uint32_t));
+  MOCK_METHOD1(onActivateConnection, void(const HTTPSessionBase&));
+  MOCK_METHOD1(onDeactivateConnection, void(const HTTPSessionBase&));
+  MOCK_METHOD1(onDestroy, void(const HTTPSessionBase&));
+  MOCK_METHOD2(onIngressMessage, void(const HTTPSessionBase&,
                                       const HTTPMessage&));
-  MOCK_METHOD1(onIngressLimitExceeded, void(const HTTPSession&));
-  MOCK_METHOD1(onIngressPaused, void(const HTTPSession&));
-  MOCK_METHOD1(onTransactionDetached, void(const HTTPSession&));
+  MOCK_METHOD1(onIngressLimitExceeded, void(const HTTPSessionBase&));
+  MOCK_METHOD1(onIngressPaused, void(const HTTPSessionBase&));
+  MOCK_METHOD1(onTransactionDetached, void(const HTTPSessionBase&));
   MOCK_METHOD1(onPingReplySent, void(int64_t));
   MOCK_METHOD0(onPingReplyReceived, void());
-  MOCK_METHOD1(onSettingsOutgoingStreamsFull, void(const HTTPSession&));
-  MOCK_METHOD1(onSettingsOutgoingStreamsNotFull, void(const HTTPSession&));
-  MOCK_METHOD1(onFlowControlWindowClosed, void(const HTTPSession&));
-  MOCK_METHOD1(onEgressBuffered, void(const HTTPSession&));
-  MOCK_METHOD1(onEgressBufferCleared, void(const HTTPSession&));
+  MOCK_METHOD1(onSettingsOutgoingStreamsFull, void(const HTTPSessionBase&));
+  MOCK_METHOD1(onSettingsOutgoingStreamsNotFull, void(const HTTPSessionBase&));
+  MOCK_METHOD1(onFlowControlWindowClosed, void(const HTTPSessionBase&));
+  MOCK_METHOD1(onEgressBuffered, void(const HTTPSessionBase&));
+  MOCK_METHOD1(onEgressBufferCleared, void(const HTTPSessionBase&));
+  MOCK_METHOD2(onSettings, void(const HTTPSessionBase&, const SettingsList&));
+  MOCK_METHOD1(onSettingsAck, void(const HTTPSessionBase&));
+};
+
+class DummyHTTPSessionStats : public HTTPSessionStats {
+ public:
+  void recordTransactionOpened() noexcept override{};
+  void recordTransactionClosed() noexcept override{};
+  void recordTransactionsServed(uint64_t) noexcept override{};
+  void recordSessionReused() noexcept override{};
+  //virtual void recordSessionIdleTime(std::chrono::seconds) noexcept {};
+  void recordTransactionStalled() noexcept override{};
+  void recordSessionStalled() noexcept override{};
+
+  void recordTTLBAExceedLimit() noexcept override{};
+  void recordTTLBAIOBSplitByEom() noexcept override{};
+  void recordTTLBANotFound() noexcept override{};
+  void recordTTLBAReceived() noexcept override{};
+  void recordTTLBATimeout() noexcept override{};
+  void recordTTLBAEomPassed() noexcept override{};
+  void recordTTLBATracked() noexcept override{};
+};
+
+class MockHTTPSessionStats: public DummyHTTPSessionStats {
+ public:
+  MockHTTPSessionStats() {}
+  GMOCK_NOEXCEPT_METHOD0(recordTransactionOpened, void());
+  GMOCK_NOEXCEPT_METHOD0(recordTransactionClosed, void());
+  GMOCK_NOEXCEPT_METHOD1(recordTransactionsServed, void(uint64_t));
+  GMOCK_NOEXCEPT_METHOD0(recordSessionReused, void());
+  GMOCK_NOEXCEPT_METHOD1(recordSessionIdleTime, void(std::chrono::seconds));
+  GMOCK_NOEXCEPT_METHOD0(recordTransactionStalled, void());
+  GMOCK_NOEXCEPT_METHOD0(recordSessionStalled, void());
 };
 
 }

@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -7,7 +7,7 @@
  *  of patent rights can be found in the PATENTS file in the same directory.
  *
  */
-#include <gtest/gtest.h>
+#include <folly/portability/GTest.h>
 #include <proxygen/lib/http/HTTPHeaderSize.h>
 #include <proxygen/lib/http/HTTPMessage.h>
 #include <proxygen/lib/http/codec/HTTP1xCodec.h>
@@ -22,31 +22,42 @@ class HTTP1xCodecCallback : public HTTPCodec::Callback {
  public:
   HTTP1xCodecCallback() {}
 
-  void onMessageBegin(HTTPCodec::StreamID stream, HTTPMessage* msg) override {}
-  void onPushMessageBegin(HTTPCodec::StreamID stream,
-                          HTTPCodec::StreamID assocStream,
-                          HTTPMessage* msg) override {}
-  void onHeadersComplete(HTTPCodec::StreamID stream,
+  void onMessageBegin(HTTPCodec::StreamID /*stream*/,
+                      HTTPMessage* /*msg*/) override {}
+  void onPushMessageBegin(HTTPCodec::StreamID /*stream*/,
+                          HTTPCodec::StreamID /*assocStream*/,
+                          HTTPMessage* /*msg*/) override {}
+  void onHeadersComplete(HTTPCodec::StreamID /*stream*/,
                          std::unique_ptr<HTTPMessage> msg) override {
     headersComplete++;
     headerSize = msg->getIngressHeaderSize();
+    msg_ = std::move(msg);
   }
-  void onBody(HTTPCodec::StreamID stream,
+  void onBody(HTTPCodec::StreamID /*stream*/,
               std::unique_ptr<folly::IOBuf> chain,
-              uint16_t padding) override {}
-  void onChunkHeader(HTTPCodec::StreamID stream, size_t length) override {}
-  void onChunkComplete(HTTPCodec::StreamID stream) override {}
-  void onTrailersComplete(HTTPCodec::StreamID stream,
-                          std::unique_ptr<HTTPHeaders> trailers) override {}
-  void onMessageComplete(HTTPCodec::StreamID stream, bool upgrade) override {}
-  void onError(HTTPCodec::StreamID stream,
-               const HTTPException& error,
-               bool newTxn) override {
+              uint16_t /*padding*/) override {
+    bodyLen += chain->computeChainDataLength();
+  }
+  void onChunkHeader(HTTPCodec::StreamID /*stream*/,
+                     size_t /*length*/) override {}
+  void onChunkComplete(HTTPCodec::StreamID /*stream*/) override {}
+  void onTrailersComplete(HTTPCodec::StreamID /*stream*/,
+                          std::unique_ptr<HTTPHeaders> /*trailers*/) override {}
+  void onMessageComplete(HTTPCodec::StreamID /*stream*/,
+                         bool /*upgrade*/) override {
+    ++messageComplete;
+  }
+  void onError(HTTPCodec::StreamID /*stream*/,
+               const HTTPException& /*error*/,
+               bool /*newTxn*/) override {
     LOG(ERROR) << "parse error";
   }
 
   uint32_t headersComplete{0};
+  uint32_t messageComplete{0};
+  uint32_t bodyLen{0};
   HTTPHeaderSize headerSize;
+  std::unique_ptr<HTTPMessage> msg_;
 };
 
 unique_ptr<folly::IOBuf> getSimpleRequestData() {
@@ -63,6 +74,55 @@ TEST(HTTP1xCodecTest, TestSimpleHeaders) {
   EXPECT_EQ(callbacks.headersComplete, 1);
   EXPECT_EQ(buffer->length(), callbacks.headerSize.uncompressed);
   EXPECT_EQ(callbacks.headerSize.compressed, 0);
+}
+
+TEST(HTTP1xCodecTest, Test09Req) {
+  HTTP1xCodec codec(TransportDirection::DOWNSTREAM);
+  HTTP1xCodecCallback callbacks;
+  codec.setCallback(&callbacks);
+  auto buffer = folly::IOBuf::copyBuffer(string("GET /yeah\r\n"));
+  codec.onIngress(*buffer);
+  EXPECT_EQ(callbacks.headersComplete, 1);
+  EXPECT_EQ(callbacks.messageComplete, 1);
+  EXPECT_EQ(buffer->length(), callbacks.headerSize.uncompressed);
+  EXPECT_EQ(callbacks.headerSize.compressed, 0);
+  buffer = folly::IOBuf::copyBuffer(string("\r\n"));
+  codec.onIngress(*buffer);
+  EXPECT_EQ(callbacks.headersComplete, 1);
+  EXPECT_EQ(callbacks.messageComplete, 1);
+}
+
+TEST(HTTP1xCodecTest, Test09ReqVers) {
+  HTTP1xCodec codec(TransportDirection::DOWNSTREAM);
+  HTTP1xCodecCallback callbacks;
+  codec.setCallback(&callbacks);
+  auto buffer = folly::IOBuf::copyBuffer(string("GET /yeah HTTP/0.9\r\n"));
+  codec.onIngress(*buffer);
+  EXPECT_EQ(callbacks.headersComplete, 1);
+  EXPECT_EQ(callbacks.messageComplete, 1);
+  EXPECT_EQ(buffer->length(), callbacks.headerSize.uncompressed);
+  EXPECT_EQ(callbacks.headerSize.compressed, 0);
+}
+
+TEST(HTTP1xCodecTest, Test09Resp) {
+  HTTP1xCodec codec(TransportDirection::UPSTREAM);
+  HTTP1xCodecCallback callbacks;
+  HTTPMessage req;
+  auto id = codec.createStream();
+  req.setHTTPVersion(0, 9);
+  req.setMethod(HTTPMethod::GET);
+  req.setURL("/");
+  codec.setCallback(&callbacks);
+  folly::IOBufQueue buf;
+  codec.generateHeader(buf, id, req, 0, true);
+  auto buffer = folly::IOBuf::copyBuffer(
+    string("iamtheverymodelofamodernmajorgeneral"));
+  codec.onIngress(*buffer);
+  EXPECT_EQ(callbacks.headersComplete, 1);
+  EXPECT_EQ(callbacks.bodyLen, buffer->computeChainDataLength());
+  EXPECT_EQ(callbacks.messageComplete, 0);
+  codec.onIngressEOF();
+  EXPECT_EQ(callbacks.messageComplete, 1);
 }
 
 TEST(HTTP1xCodecTest, TestBadHeaders) {
@@ -185,8 +245,8 @@ TEST(HTTP1xCodecTest, TestChunkedUpstream) {
   HTTPMessage msg;
   msg.setHTTPVersion(1, 1);
   msg.setURL("https://www.facebook.com/");
-  msg.getHeaders().set("Host", "www.facebook.com");
-  msg.getHeaders().set("Transfer-Encoding", "chunked");
+  msg.getHeaders().set(HTTP_HEADER_HOST, "www.facebook.com");
+  msg.getHeaders().set(HTTP_HEADER_TRANSFER_ENCODING, "chunked");
   msg.setIsChunked(true);
 
   HTTPHeaderSize size;
@@ -298,3 +358,168 @@ TEST(HTTP1xCodecTest, TestMultipleDistinctContentLengthHeaders) {
   EXPECT_EQ(callbacks.headersComplete, 0);
   EXPECT_EQ(callbacks.lastParseError->getHttpStatusCode(), 400);
 }
+
+TEST(HTTP1xCodecTest, TestCorrectTransferEncodingHeader) {
+  HTTP1xCodec downstream(TransportDirection::DOWNSTREAM);
+  FakeHTTPCodecCallback callbacks;
+  downstream.setCallback(&callbacks);
+  folly::IOBufQueue writeBuf(folly::IOBufQueue::cacheChainLength());
+
+  // Generate a POST request with folded
+  auto reqBuf = folly::IOBuf::copyBuffer(
+      "POST /www.facebook.com HTTP/1.1\r\nHost: www.facebook.com\r\n"
+      "Transfer-Encoding: chunked\r\n\r\n");
+  downstream.onIngress(*reqBuf);
+
+  // Check that the request fails before the codec finishes parsing the headers
+  EXPECT_EQ(callbacks.streamErrors, 0);
+  EXPECT_EQ(callbacks.messageBegin, 1);
+  EXPECT_EQ(callbacks.headersComplete, 1);
+}
+
+TEST(HTTP1xCodecTest, TestFoldedTransferEncodingHeader) {
+  HTTP1xCodec downstream(TransportDirection::DOWNSTREAM);
+  FakeHTTPCodecCallback callbacks;
+  downstream.setCallback(&callbacks);
+  folly::IOBufQueue writeBuf(folly::IOBufQueue::cacheChainLength());
+
+  // Generate a POST request with folded
+  auto reqBuf = folly::IOBuf::copyBuffer(
+      "POST /www.facebook.com HTTP/1.1\r\nHost: www.facebook.com\r\n"
+      "Transfer-Encoding: \r\n chunked\r\nContent-Length: 8\r\n\r\n");
+  downstream.onIngress(*reqBuf);
+
+  // Check that the request fails before the codec finishes parsing the headers
+  EXPECT_EQ(callbacks.streamErrors, 1);
+  EXPECT_EQ(callbacks.messageBegin, 1);
+  EXPECT_EQ(callbacks.headersComplete, 0);
+  EXPECT_EQ(callbacks.lastParseError->getHttpStatusCode(), 400);
+}
+
+TEST(HTTP1xCodecTest, TestBadTransferEncodingHeader) {
+  HTTP1xCodec downstream(TransportDirection::DOWNSTREAM);
+  FakeHTTPCodecCallback callbacks;
+  downstream.setCallback(&callbacks);
+  folly::IOBufQueue writeBuf(folly::IOBufQueue::cacheChainLength());
+
+  auto reqBuf = folly::IOBuf::copyBuffer(
+      "POST /www.facebook.com HTTP/1.1\r\nHost: www.facebook.com\r\n"
+      "Transfer-Encoding: chunked, zorg\r\n\r\n");
+  downstream.onIngress(*reqBuf);
+
+  // Check that the request fails before the codec finishes parsing the headers
+  EXPECT_EQ(callbacks.streamErrors, 1);
+  EXPECT_EQ(callbacks.messageBegin, 1);
+  EXPECT_EQ(callbacks.headersComplete, 0);
+  EXPECT_EQ(callbacks.lastParseError->getHttpStatusCode(), 400);
+}
+
+TEST(HTTP1xCodecTest, Test1xxConnectionHeader) {
+  HTTP1xCodec upstream(TransportDirection::UPSTREAM);
+  HTTP1xCodec downstream(TransportDirection::DOWNSTREAM);
+  HTTP1xCodecCallback callbacks;
+  upstream.setCallback(&callbacks);
+  HTTPMessage resp;
+  resp.setStatusCode(100);
+  resp.setHTTPVersion(1, 1);
+  resp.getHeaders().add(HTTP_HEADER_CONNECTION, "Upgrade");
+  folly::IOBufQueue writeBuf(folly::IOBufQueue::cacheChainLength());
+  auto streamID = downstream.createStream();
+  downstream.generateHeader(writeBuf, streamID, resp);
+  upstream.onIngress(*writeBuf.front());
+  EXPECT_EQ(callbacks.headersComplete, 1);
+  EXPECT_EQ(
+    callbacks.msg_->getHeaders().getSingleOrEmpty(HTTP_HEADER_CONNECTION),
+    "Upgrade");
+  resp.setStatusCode(200);
+  resp.getHeaders().remove(HTTP_HEADER_CONNECTION);
+  resp.getHeaders().add(HTTP_HEADER_CONTENT_LENGTH, "0");
+  writeBuf.move();
+  downstream.generateHeader(writeBuf, streamID, resp);
+  upstream.onIngress(*writeBuf.front());
+  EXPECT_EQ(callbacks.headersComplete, 2);
+  EXPECT_EQ(
+    callbacks.msg_->getHeaders().getSingleOrEmpty(HTTP_HEADER_CONNECTION),
+    "keep-alive");
+}
+
+TEST(HTTP1xCodecTest, TestChainedBody) {
+  HTTP1xCodec codec(TransportDirection::DOWNSTREAM);
+  MockHTTPCodecCallback callbacks;
+  codec.setCallback(&callbacks);
+
+  folly::IOBufQueue bodyQueue;
+  ON_CALL(callbacks, onBody(1, _, _))
+      .WillByDefault(Invoke(
+          [&bodyQueue](HTTPCodec::StreamID, std::shared_ptr<folly::IOBuf> buf,
+                       uint16_t) { bodyQueue.append(buf->clone()); }));
+
+  folly::IOBufQueue reqQueue;
+  reqQueue.append(folly::IOBuf::copyBuffer(
+      "POST /test.php HTTP/1.1\r\nHost: www.test.com\r\n"
+      "Content-Length: 10\r\n\r\nabcde"));
+  reqQueue.append(folly::IOBuf::copyBuffer("fghij"));
+
+  while (!reqQueue.empty()) {
+    auto processed = codec.onIngress(*reqQueue.front());
+    if (processed == 0) {
+      break;
+    }
+    reqQueue.trimStart(processed);
+  }
+
+  EXPECT_TRUE(folly::IOBufEqual()(*bodyQueue.front(),
+                                  *folly::IOBuf::copyBuffer("abcdefghij")));
+}
+
+class ConnectionHeaderTest:
+    public TestWithParam<std::pair<std::list<string>, string>> {
+ public:
+  using ParamType = std::pair<std::list<string>, string>;
+};
+
+TEST_P(ConnectionHeaderTest, TestConnectionHeaders) {
+  HTTP1xCodec upstream(TransportDirection::UPSTREAM);
+  HTTP1xCodec downstream(TransportDirection::DOWNSTREAM);
+  HTTP1xCodecCallback callbacks;
+  downstream.setCallback(&callbacks);
+  HTTPMessage req;
+  req.setMethod(HTTPMethod::GET);
+  req.setURL("/");
+  auto val = GetParam();
+  for (auto header: val.first) {
+    req.getHeaders().add(HTTP_HEADER_CONNECTION, header);
+  }
+  folly::IOBufQueue writeBuf(folly::IOBufQueue::cacheChainLength());
+  upstream.generateHeader(writeBuf, upstream.createStream(), req);
+  downstream.onIngress(*writeBuf.front());
+  EXPECT_EQ(callbacks.headersComplete, 1);
+  auto& headers = callbacks.msg_->getHeaders();
+  EXPECT_EQ(headers.getSingleOrEmpty(HTTP_HEADER_CONNECTION),
+            val.second);
+}
+
+
+INSTANTIATE_TEST_CASE_P(
+  HTTP1xCodec,
+  ConnectionHeaderTest,
+  ::testing::Values(
+    // Moves close to the end
+    ConnectionHeaderTest::ParamType(
+      { "foo", "bar", "close", "baz" }, "foo, bar, baz, close"),
+    // has to resize token vector
+    ConnectionHeaderTest::ParamType(
+      { "foo", "bar, close", "baz" }, "foo, bar, baz, close"),
+    // whitespace trimming
+    ConnectionHeaderTest::ParamType(
+      { " foo", "bar, close ", " baz " }, "foo, bar, baz, close"),
+    // No close token => keep-alive
+    ConnectionHeaderTest::ParamType(
+      { "foo", "bar, boo", "baz" }, "foo, bar, boo, baz, keep-alive"),
+    // close and keep-alive => close
+    ConnectionHeaderTest::ParamType(
+      { "foo", "keep-alive, boo", "close" }, "foo, boo, close"),
+    // upgrade gets no special treatment
+    ConnectionHeaderTest::ParamType(
+      { "foo", "upgrade, boo", "baz" }, "foo, upgrade, boo, baz, keep-alive")
+  ));

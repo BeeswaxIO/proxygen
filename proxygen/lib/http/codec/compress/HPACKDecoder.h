@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -23,20 +23,15 @@ namespace proxygen {
 
 class HPACKDecoder : public HPACKContext {
  public:
-  enum Version: uint8_t {
-    HPACK05 = 0,
-    HPACK09 = 1,
-  };
-
   explicit HPACKDecoder(
-    HPACK::MessageType msgType,
     uint32_t tableSize=HPACK::kTableSize,
     uint32_t maxUncompressed=HeaderCodec::kMaxUncompressed,
-    Version version=Version::HPACK05)
-      : HPACKContext(msgType, tableSize),
+    bool useBaseIndex=false)
+      // even if useBaseIndex is true, decoder doesn't need epoch so
+      // can use the 'HPACK' table impl
+      : HPACKContext(tableSize, false, useBaseIndex),
         maxTableSize_(tableSize),
-        maxUncompressed_(maxUncompressed),
-        version_(version) {}
+        maxUncompressed_(maxUncompressed) {}
 
   typedef std::vector<HPACKHeader> headers_t;
 
@@ -75,14 +70,30 @@ class HPACKDecoder : public HPACKContext {
     maxTableSize_ = maxSize;
   }
 
+  void setMaxUncompressed(uint32_t maxUncompressed) {
+    maxUncompressed_ = maxUncompressed;
+  }
+
+  uint32_t getTableSize() const {
+    return table_.capacity();
+  }
+
+  uint32_t getBytesStored() const {
+    return table_.bytes();
+  }
+
+  uint32_t getHeadersStored() const {
+    return table_.size();
+  }
+
  protected:
   bool isValid(uint32_t index);
-
-  virtual uint32_t emitRefset(headers_t& emitted);
 
   virtual const huffman::HuffTree& getHuffmanTree() const;
 
   uint32_t emit(const HPACKHeader& header, headers_t* emitted);
+
+  void handleBaseIndex(HPACKDecodeBuffer& dbuf);
 
   virtual uint32_t decodeIndexedHeader(HPACKDecodeBuffer& dbuf,
                                        headers_t* emitted);
@@ -92,11 +103,14 @@ class HPACKDecoder : public HPACKContext {
 
   uint32_t decodeHeader(HPACKDecodeBuffer& dbuf, headers_t* emitted);
 
+  void handleTableSizeUpdate(HPACKDecodeBuffer& dbuf);
+
   HPACK::DecodeError err_{HPACK::DecodeError::NONE};
   uint32_t maxTableSize_;
   uint32_t maxUncompressed_;
   HeaderCodec::StreamingCallback* streamingCb_{nullptr};
-  Version version_;
 };
+
+HeaderDecodeError hpack2headerCodecError(HPACK::DecodeError err);
 
 }

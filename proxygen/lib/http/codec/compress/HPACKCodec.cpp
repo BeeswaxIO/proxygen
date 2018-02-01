@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -12,7 +12,9 @@
 #include <algorithm>
 #include <folly/String.h>
 #include <folly/io/Cursor.h>
+#include <proxygen/lib/http/codec/compress/HeaderIndexingStrategy.h>
 #include <proxygen/lib/http/codec/compress/HPACKHeader.h>
+#include <iosfwd>
 
 using folly::IOBuf;
 using folly::io::Cursor;
@@ -24,38 +26,32 @@ using std::vector;
 
 namespace proxygen {
 
-
-HPACKCodec::HPACKCodec(TransportDirection direction) {
-  HPACK::MessageType encoderType;
-  HPACK::MessageType decoderType;
-  if (direction == TransportDirection::DOWNSTREAM) {
-    decoderType = HPACK::MessageType::REQ;
-    encoderType = HPACK::MessageType::RESP;
-  } else {
-    // UPSTREAM
-    decoderType = HPACK::MessageType::RESP;
-    encoderType = HPACK::MessageType::REQ;
-  }
-  encoder_ = folly::make_unique<HPACKEncoder>(encoderType, true);
-  decoder_ = folly::make_unique<HPACKDecoder>(decoderType, HPACK::kTableSize,
-                                              maxUncompressed_);
-}
+HPACKCodec::HPACKCodec(TransportDirection /*direction*/,
+                       bool emitSequenceNumbers,
+                       bool useBaseIndex,
+                       bool autoCommit)
+    : encoder_(true, HPACK::kTableSize, emitSequenceNumbers, useBaseIndex,
+               autoCommit),
+      decoder_(HPACK::kTableSize, maxUncompressed_, useBaseIndex) {}
 
 unique_ptr<IOBuf> HPACKCodec::encode(vector<Header>& headers) noexcept {
-  vector<HPACKHeader> converted;
+  bool eviction = false;
+  return encode(headers, eviction);
+}
+
+unique_ptr<IOBuf> HPACKCodec::encode(vector<Header>& headers,
+                                     bool& eviction) noexcept {
   // convert to HPACK API format
+  vector<HPACKHeader> converted;
+  converted.reserve(headers.size());
   uint32_t uncompressed = 0;
   for (const auto& h : headers) {
+    // HPACKHeader automatically lowercases
     converted.emplace_back(*h.name, *h.value);
-    // This is ugly but since we're not changing the size
-    // of the string I'm assuming this is OK
     auto& header = converted.back();
-    char* mutableName = const_cast<char*>(header.name.data());
-    folly::toLowerAscii(mutableName, header.name.size());
-
     uncompressed += header.name.size() + header.value.size() + 2;
   }
-  auto buf = encoder_->encode(converted, encodeHeadroom_);
+  auto buf = encoder_.encode(converted, encodeHeadroom_, &eviction);
   encodedSize_.compressed = 0;
   if (buf) {
     encodedSize_.compressed = buf->computeChainDataLength();
@@ -71,15 +67,15 @@ Result<HeaderDecodeResult, HeaderDecodeError>
 HPACKCodec::decode(Cursor& cursor, uint32_t length) noexcept {
   outHeaders_.clear();
   decodedHeaders_.clear();
-  auto consumed = decoder_->decode(cursor, length, decodedHeaders_);
-  if (decoder_->hasError()) {
-    LOG(ERROR) << "decoder state: " << decoder_->getTable();
+  auto consumed = decoder_.decode(cursor, length, decodedHeaders_);
+  if (decoder_.hasError()) {
+    LOG(ERROR) << "decoder state: " << decoder_.getTable();
     LOG(ERROR) << "partial headers: ";
     for (const auto& hdr: decodedHeaders_) {
       LOG(ERROR) << "name=" << hdr.name.c_str()
                  << " value=" << hdr.value.c_str();
     }
-    auto err = decoder_->getError();
+    auto err = decoder_.getError();
     if (err == HPACK::DecodeError::HEADERS_TOO_LARGE ||
         err == HPACK::DecodeError::LITERAL_TOO_LARGE) {
       if (stats_) {
@@ -121,37 +117,46 @@ void HPACKCodec::decodeStreaming(
     HeaderCodec::StreamingCallback* streamingCb) noexcept {
   decodedSize_.uncompressed = 0;
   streamingCb_ = streamingCb;
-  auto consumed = decoder_->decodeStreaming(cursor, length, this);
-  if (decoder_->hasError()) {
+  auto consumed = decoder_.decodeStreaming(cursor, length, this);
+  if (decoder_.hasError()) {
     onDecodeError(HeaderDecodeError::NONE);
     return;
   }
   decodedSize_.compressed = consumed;
-  onHeadersComplete();
+  onHeadersComplete(decodedSize_);
 }
 
-void HPACKCodec::onHeader(const std::string& name, const std::string& value) {
+void HPACKCodec::onHeader(const folly::fbstring& name,
+                          const folly::fbstring& value) {
   assert(streamingCb_ != nullptr);
   decodedSize_.uncompressed += name.size() + value.size() + 2;
   streamingCb_->onHeader(name, value);
 }
 
-void HPACKCodec::onHeadersComplete() {
+void HPACKCodec::onHeadersComplete(HTTPHeaderSize decodedSize) {
   assert(streamingCb_ != nullptr);
   if (stats_) {
     stats_->recordDecode(Type::HPACK, decodedSize_);
   }
-  streamingCb_->onHeadersComplete();
+  streamingCb_->onHeadersComplete(decodedSize);
 }
 
-void HPACKCodec::onDecodeError(HeaderDecodeError decodeError) {
+void HPACKCodec::onDecodeError(HeaderDecodeError /*decodeError*/) {
   assert(streamingCb_ != nullptr);
   if (stats_) {
     stats_->recordDecodeError(Type::HPACK);
   }
-  if (decoder_->getError() == HPACK::DecodeError::HEADERS_TOO_LARGE) {
-    streamingCb_->onDecodeError(HeaderDecodeError::HEADERS_TOO_LARGE);
-  }
-  streamingCb_->onDecodeError(HeaderDecodeError::BAD_ENCODING);
+  streamingCb_->onDecodeError(hpack2headerCodecError(decoder_.getError()));
 }
+
+void HPACKCodec::describe(std::ostream& stream) const {
+  stream << "DecoderTable:\n" << decoder_;
+  stream << "EncoderTable:\n" << encoder_;
+}
+
+std::ostream& operator<<(std::ostream& os, const HPACKCodec& codec) {
+  codec.describe(os);
+  return os;
+}
+
 }

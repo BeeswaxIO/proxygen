@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -16,11 +16,13 @@
 
 using folly::IOBuf;
 using folly::IOBufQueue;
+using folly::StringPiece;
 using std::string;
 using std::unique_ptr;
 
 namespace {
 
+static const std::string kChunked = "chunked";
 const char CRLF[] = "\r\n";
 
 /**
@@ -64,9 +66,9 @@ appendUint(IOBufQueue& queue, size_t& len, uint64_t value) {
   (queue).append(str, sizeof(str) - 1)
 
 void
-appendString(IOBufQueue& queue, size_t& len, const string& str) {
-  queue.append(str.data(), str.length());
-  len += str.length();
+appendString(IOBufQueue& queue, size_t& len, StringPiece str) {
+  queue.append(str.data(), str.size());
+  len += str.size();
 }
 
 const std::pair<uint8_t, uint8_t> kHTTPVersion10(1, 0);
@@ -113,6 +115,8 @@ HTTP1xCodec::HTTP1xCodec(TransportDirection direction, bool forceUpstream1_1)
   case TransportDirection::UPSTREAM:
     http_parser_init(&parser_, HTTP_RESPONSE);
     break;
+  default:
+    LOG(FATAL) << "Unknown transport direction.";
   }
   parser_.data = this;
 }
@@ -180,6 +184,17 @@ HTTP1xCodec::onIngress(const IOBuf& buf) {
     CHECK(!parserActive_);
     parserActive_ = true;
     currentIngressBuf_ = &buf;
+    if (transportDirection_ == TransportDirection::UPSTREAM &&
+        parser_.http_major == 0 && parser_.http_minor == 9) {
+      // HTTP/0.9 responses have no header block, so create a fake 200 response
+      // and put the codec in upgrade mode
+      onMessageBegin();
+      msg_->setStatusCode(200);
+      onHeadersComplete(0);
+      parserActive_ = false;
+      ingressUpgradeComplete_ = true;
+      return onIngress(buf);
+    }
     size_t bytesParsed = http_parser_execute(&parser_,
                                              getParserSettings(),
                                              (const char*)buf.data(),
@@ -252,7 +267,7 @@ HTTP1xCodec::onParserError(const char* what) {
   }
   // store the ingress buffer
   if (currentIngressBuf_) {
-    error.setCurrentIngressBuf(currentIngressBuf_->clone());
+    error.setCurrentIngressBuf(currentIngressBuf_->cloneOne());
   }
   if (transportDirection_ == TransportDirection::DOWNSTREAM &&
       egressTxnID_ < ingressTxnID_) {
@@ -369,6 +384,9 @@ HTTP1xCodec::generateHeader(IOBufQueue& writeBuf,
   size_t len = 0;
   switch (transportDirection_) {
   case TransportDirection::DOWNSTREAM:
+    if (version.first == 0 && version.second == 9) {
+      return;
+    }
     appendLiteral(writeBuf, len, "HTTP/");
     appendUint(writeBuf, len, version.first);
     appendLiteral(writeBuf, len, ".");
@@ -409,10 +427,16 @@ HTTP1xCodec::generateHeader(IOBufQueue& writeBuf,
   }
   egressChunked_ &= mayChunkEgress_;
   appendLiteral(writeBuf, len, CRLF);
+  if (version.first == 0 && version.second == 9) {
+    parser_.http_major = 0;
+    parser_.http_minor = 9;
+    return;
+  }
   const string* deferredContentLength = nullptr;
   bool hasTransferEncodingChunked = false;
-  bool hasUpgradeHeader = false;
   bool hasDateHeader = false;
+  std::vector<StringPiece> connectionTokens;
+  size_t lastConnectionToken = 0;
   msg.getHeaders().forEachWithCode([&] (HTTPHeaderCode code,
                                         const string& header,
                                         const string& value) {
@@ -420,22 +444,28 @@ HTTP1xCodec::generateHeader(IOBufQueue& writeBuf,
       // Write the Content-Length last (t1071703)
       deferredContentLength = &value;
       return; // continue
-    } else if (code == HTTP_HEADER_CONNECTION) {
-      // TODO: add support for the case where "close" is part of
-      // a comma-separated list of values
+    } else if (code == HTTP_HEADER_CONNECTION && !is1xxResponse_) {
       static const string kClose = "close";
-      if (caseInsensitiveEqual(value, kClose)) {
-        keepalive_ = false;
+      static const string kKeepAlive = "keep-alive";
+      folly::split(',', value, connectionTokens);
+      for (auto curConnectionToken = lastConnectionToken;
+           curConnectionToken < connectionTokens.size();
+           curConnectionToken++) {
+        auto token = trimWhitespace(connectionTokens[curConnectionToken]);
+        if (caseInsensitiveEqual(token, kClose)) {
+          keepalive_ = false;
+        } else if (!caseInsensitiveEqual(token, kKeepAlive)) {
+          connectionTokens[lastConnectionToken++] = token;
+        } // else eat the keep-alive token
       }
+      connectionTokens.resize(lastConnectionToken);
       // We'll generate a new Connection header based on the keepalive_ state
       return;
     } else if (code == HTTP_HEADER_UPGRADE && upstream && txn == 1) {
       // save in case we get a 101 Switching Protocols
       upgradeHeader_ = value;
-      hasUpgradeHeader = true;
     } else if (!hasTransferEncodingChunked &&
                code == HTTP_HEADER_TRANSFER_ENCODING) {
-      static const string kChunked = "chunked";
       if (!caseInsensitiveEqual(value, kChunked)) {
         return;
       }
@@ -443,8 +473,6 @@ HTTP1xCodec::generateHeader(IOBufQueue& writeBuf,
       if (!mayChunkEgress_) {
         return;
       }
-    } else if (code == HTTP_HEADER_UPGRADE) {
-      hasUpgradeHeader = true;
     } else if (!hasDateHeader && code == HTTP_HEADER_DATE) {
       hasDateHeader = true;
     }
@@ -488,12 +516,13 @@ HTTP1xCodec::generateHeader(IOBufQueue& writeBuf,
   if (downstream && !hasDateHeader) {
     addDateHeader(writeBuf, len);
   }
-  if (!is1xxResponse_ || upstream || hasUpgradeHeader) {
+  if (!is1xxResponse_ || upstream || !connectionTokens.empty()) {
     appendLiteral(writeBuf, len, "Connection: ");
-    if (hasUpgradeHeader) {
-      // Upgrade header needs to have 'upgrade' keyword as the connection type
-      appendLiteral(writeBuf, len, "upgrade\r\n");
-    } else if (keepalive_) {
+    for (auto token: connectionTokens) {
+      appendString(writeBuf, len, token);
+      appendLiteral(writeBuf, len, ", ");
+    }
+    if (keepalive_) {
       appendLiteral(writeBuf, len, "keep-alive\r\n");
     } else {
       appendLiteral(writeBuf, len, "close\r\n");
@@ -502,7 +531,7 @@ HTTP1xCodec::generateHeader(IOBufQueue& writeBuf,
   if (deferredContentLength) {
     appendLiteral(writeBuf, len, "Content-Length: ");
     appendString(writeBuf, len, *deferredContentLength);
-    appendString(writeBuf, len, CRLF);
+    appendLiteral(writeBuf, len, CRLF);
   }
   appendLiteral(writeBuf, len, CRLF);
   if (eom) {
@@ -515,12 +544,11 @@ HTTP1xCodec::generateHeader(IOBufQueue& writeBuf,
   }
 }
 
-size_t
-HTTP1xCodec::generateBody(IOBufQueue& writeBuf,
-                          StreamID txn,
-                          unique_ptr<IOBuf> chain,
-                          boost::optional<uint8_t> padding,
-                          bool eom) {
+size_t HTTP1xCodec::generateBody(IOBufQueue& writeBuf,
+                                 StreamID txn,
+                                 unique_ptr<IOBuf> chain,
+                                 boost::optional<uint8_t> /*padding*/,
+                                 bool eom) {
   DCHECK_EQ(txn, egressTxnID_);
   if (!chain) {
     return 0;
@@ -557,7 +585,7 @@ HTTP1xCodec::generateBody(IOBufQueue& writeBuf,
 }
 
 size_t HTTP1xCodec::generateChunkHeader(IOBufQueue& writeBuf,
-                                        StreamID txn,
+                                        StreamID /*txn*/,
                                         size_t length) {
   // TODO: Format directly into the IOBuf, rather than copying after the fact.
   // IOBufQueue::append() currently forces us to copy.
@@ -581,7 +609,7 @@ size_t HTTP1xCodec::generateChunkHeader(IOBufQueue& writeBuf,
 }
 
 size_t HTTP1xCodec::generateChunkTerminator(IOBufQueue& writeBuf,
-                                            StreamID txn) {
+                                            StreamID /*txn*/) {
   if (egressChunked_ && inChunk_) {
     inChunk_ = false;
     writeBuf.append("\r\n", 2);
@@ -641,9 +669,9 @@ size_t HTTP1xCodec::generateEOM(IOBufQueue& writeBuf, StreamID txn) {
   return len;
 }
 
-size_t HTTP1xCodec::generateRstStream(IOBufQueue& writeBuf,
-                                      StreamID txn,
-                                      ErrorCode statusCode) {
+size_t HTTP1xCodec::generateRstStream(IOBufQueue& /*writeBuf*/,
+                                      StreamID /*txn*/,
+                                      ErrorCode /*statusCode*/) {
   // statusCode ignored for HTTP/1.1
   // We won't be able to send anything else on the transport after this.
   disableKeepalivePending_ = true;
@@ -786,14 +814,23 @@ HTTP1xCodec::onHeadersComplete(size_t len) {
     pushHeaderNameAndValue(msg_->getHeaders());
   }
 
-  // discard messages with multiple content-length headers (t12767790)
+  // discard messages with folded or multiple valued Transfer-Encoding headers
+  // ex : "chunked , zorg\r\n" or "\r\n chunked \r\n" (t12767790)
   HTTPHeaders& hdrs = msg_->getHeaders();
-  if (hdrs.getNumberOfValues("Content-Length") > 1) {
+  const std::string& headerVal =
+    hdrs.getSingleOrEmpty(HTTP_HEADER_TRANSFER_ENCODING);
+  if (!headerVal.empty() && !caseInsensitiveEqual(headerVal, kChunked)) {
+      LOG(ERROR) << "Invalid Transfer-Encoding header. Value =" << headerVal;
+      return -1;
+  }
+
+  // discard messages with multiple content-length headers (t12767790)
+  if (hdrs.getNumberOfValues(HTTP_HEADER_CONTENT_LENGTH) > 1) {
     // Only reject the message if the Content-Length headers have different
     // values
     folly::Optional<folly::StringPiece> contentLen;
     bool error = hdrs.forEachValueOfHeader(
-        "Content-Length", [&] (folly::StringPiece value) -> bool {
+        HTTP_HEADER_CONTENT_LENGTH, [&] (folly::StringPiece value) -> bool {
       if (!contentLen.hasValue()) {
         contentLen = value;
         return false;
@@ -842,7 +879,7 @@ HTTP1xCodec::onHeadersComplete(size_t len) {
     reason_.clear();
   }
 
-  folly::ScopeGuard g = folly::makeGuard([this] {
+  auto g = folly::makeGuard([this] {
       // Always clear the outbound upgrade header after we receive a response
       if (transportDirection_ == TransportDirection::UPSTREAM &&
           parser_.status_code != 100) {
@@ -910,7 +947,7 @@ HTTP1xCodec::onHeadersComplete(size_t len) {
           upgradeResult_ = *result;
           // unfortunately have to copy because msg_ is passed to
           // onHeadersComplete
-          upgradeRequest_ = folly::make_unique<HTTPMessage>(*msg_);
+          upgradeRequest_ = std::make_unique<HTTPMessage>(*msg_);
         }
       }
     }
@@ -952,6 +989,9 @@ HTTP1xCodec::onHeadersComplete(size_t len) {
   headerSize_.uncompressed += len;
   msg_->setIngressHeaderSize(headerSize_);
 
+  if (userAgent_.empty()) {
+    userAgent_ = msg_->getHeaders().getSingleOrEmpty(HTTP_HEADER_USER_AGENT);
+  }
   callback_->onHeadersComplete(ingressTxnID_, std::move(msg_));
 
   // 1 is a magic value that tells the http_parser not to expect a
@@ -969,9 +1009,10 @@ HTTP1xCodec::onBody(const char* buf, size_t len) {
   const char* dataEnd = dataStart + currentIngressBuf_->length();
   DCHECK_GE(buf, dataStart);
   DCHECK_LE(buf + len, dataEnd);
-  unique_ptr<IOBuf> clone(currentIngressBuf_->clone());
+  unique_ptr<IOBuf> clone(currentIngressBuf_->cloneOne());
   clone->trimStart(buf - dataStart);
   clone->trimEnd(dataEnd - (buf + len));
+  DCHECK_EQ(len, clone->computeChainDataLength());
   callback_->onBody(ingressTxnID_, std::move(clone), 0);
   return 0;
 }
@@ -1115,9 +1156,9 @@ HTTP1xCodec::onHeaderValueCB(http_parser* parser, const char* buf, size_t len) {
   }
 }
 
-int
-HTTP1xCodec::onHeadersCompleteCB(http_parser* parser,
-                                 const char* buf, size_t len) {
+int HTTP1xCodec::onHeadersCompleteCB(http_parser* parser,
+                                     const char* /*buf*/,
+                                     size_t len) {
   HTTP1xCodec* codec = static_cast<HTTP1xCodec*>(parser->data);
   DCHECK(codec != nullptr);
   DCHECK_EQ(&codec->parser_, parser);

@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -35,19 +35,28 @@ class Service {
   virtual ~Service();
 
   /**
-   * Start the service.
+   * Initialize the service.
    *
-   * start() will be invoked from proxygen's main thread, before the worker
+   * init() will be invoked from proxygen's main thread, before the worker
    * threads have started processing their event loops.
    *
    * The return value indicates if the service is enabled or not.  Return true
-   * if the service is enabled and was started successfully, and false if the
-   * service is disabled and is intentionally not started.  Throw an exception
-   * if the service is enabled and is supposed to be running, but an error
-   * occurred starting it.
+   * if the service is enabled and was initialized successfully, and false if
+   * the service is disabled or is intialized successfully.  Throw an exception
+   * if an error occurred initializing it.
    */
-  virtual void start(folly::EventBase* mainEventBase,
-                     const std::list<RequestWorker*>& workers) = 0;
+  virtual void init(folly::EventBase* mainEventBase,
+                    const std::list<RequestWorker*>& workers) = 0;
+
+  /**
+   * Start to accept connection on the listening sockect(s)
+   *
+   * All the expansive preparation work should be done befofe startAccepting(),
+   * i.g., in constructor or init().  startAccepting() should be lightweight,
+   * ideally just the call of accept() on all the listening sockects.
+   * Otherwise, the first accepted connection may experience high latency.
+   */
+  virtual void startAccepting() {}
 
   /**
    * Mark the service as about to stop; invoked from main thread.
@@ -75,7 +84,7 @@ class Service {
    * then proxygen might call dropConnections() several times to gradually
    * stop all processing before finally calling forceStop().
    */
-  virtual void dropConnections(double pct) {}
+  virtual void dropConnections(double /*pct*/) {}
 
   /**
    * Forcibly stop the service.
@@ -114,7 +123,7 @@ class Service {
    * cleanupWorkerState().  Once forceStop() is invoked, the remaining threads
    * will forcibly exit and then call cleanupWorkerState().)
    */
-  virtual void cleanupWorkerState(RequestWorker* worker) {}
+  virtual void cleanupWorkerState(RequestWorker* /*worker*/) {}
 
   /**
    * Add a new ServiceWorker (subclasses should create one ServiceWorker
@@ -135,11 +144,12 @@ class Service {
    */
   void clearServiceWorkers();
 
-  /**
-   * Start even when config_test_only is set - default to false
-   */
-  virtual bool startWithConfigTest(bool configTestOnly) {
-    return !configTestOnly;
+  void addWorkerEventBase(folly::EventBase* evb) {
+    workerEvbs_.push_back(evb);
+  }
+
+  const std::vector<folly::EventBase*>& getWorkerEventBases() {
+    return workerEvbs_;
   }
 
  private:
@@ -149,6 +159,7 @@ class Service {
 
   // Workers
   std::list<std::unique_ptr<ServiceWorker>> workers_;
+  std::vector<folly::EventBase*> workerEvbs_;
 };
 
 } // proxygen

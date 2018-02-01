@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -9,7 +9,6 @@
  */
 #include <gflags/gflags.h>
 #include <folly/Memory.h>
-#include <folly/Portability.h>
 #include <folly/io/async/EventBaseManager.h>
 #include <proxygen/httpserver/HTTPServer.h>
 #include <proxygen/httpserver/RequestHandlerFactory.h>
@@ -36,7 +35,7 @@ DEFINE_int32(threads, 0, "Number of threads to listen on. Numbers <= 0 "
 
 class PushRequestHandlerFactory : public RequestHandlerFactory {
  public:
-  void onServerStart(folly::EventBase* evb) noexcept override {
+  void onServerStart(folly::EventBase* /*evb*/) noexcept override {
     stats_.reset(new PushStats);
   }
 

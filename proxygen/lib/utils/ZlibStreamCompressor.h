@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -9,17 +9,16 @@
  */
 #pragma once
 
-#include <memory>
-#include <zlib.h>
 #include <folly/portability/GFlags.h>
+#include <memory>
 #include <proxygen/lib/utils/ZlibStreamDecompressor.h>
+#include <zlib.h>
 
 namespace folly {
 class IOBuf;
 }
 
-DECLARE_int64(zlib_buffer_growth);
-DECLARE_int64(zlib_buffer_minsize);
+DECLARE_int64(zlib_compressor_buffer_growth);
 
 namespace proxygen {
 

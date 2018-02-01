@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -9,7 +9,7 @@
  */
 #pragma once
 
-#include <gmock/gmock.h>
+#include <folly/portability/GMock.h>
 #include <proxygen/lib/http/codec/HTTPCodec.h>
 
 namespace proxygen {
@@ -22,6 +22,7 @@ namespace proxygen {
 class MockHTTPCodec: public HTTPCodec {
  public:
   MOCK_CONST_METHOD0(getProtocol, CodecProtocol());
+  MOCK_CONST_METHOD0(getUserAgent, const std::string&());
   MOCK_CONST_METHOD0(getTransportDirection,  TransportDirection());
   MOCK_CONST_METHOD0(supportsStreamFlowControl, bool());
   MOCK_CONST_METHOD0(supportsSessionFlowControl, bool());
@@ -139,6 +140,8 @@ class MockHTTPCodecCallback: public HTTPCodec::Callback {
             std::shared_ptr<HTTPException>(new HTTPException(exc)),
             newStream);
   }
+  MOCK_METHOD5(onFrameHeader,
+      void(uint32_t, uint8_t, uint32_t, uint8_t, uint16_t));
   MOCK_METHOD2(onAbort, void(HTTPCodec::StreamID, ErrorCode));
   MOCK_METHOD3(onGoaway,
                void(uint64_t, ErrorCode, std::shared_ptr<folly::IOBuf>));

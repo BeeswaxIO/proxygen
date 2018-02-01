@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -9,20 +9,19 @@
  */
 #pragma once
 
+#include <folly/io/async/DestructorCheck.h>
 #include <folly/Memory.h>
 #include <proxygen/lib/http/session/HTTPTransaction.h>
-#include <proxygen/lib/utils/DestructorCheck.h>
 
 namespace proxygen {
 
 static const std::string kMessageFilterDefaultName_ = "Unknown";
 
 class HTTPMessageFilter: public HTTPTransaction::Handler,
-                         public DestructorCheck {
+                         public folly::DestructorCheck {
  public:
   void setNextTransactionHandler(HTTPTransaction::Handler* next) {
-    CHECK(next);
-    nextTransactionHandler_ = next;
+    nextTransactionHandler_ = CHECK_NOTNULL(next);
   }
   HTTPTransaction::Handler* getNextTransactionHandler() {
     return nextTransactionHandler_;

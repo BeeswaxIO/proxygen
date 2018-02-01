@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -14,7 +14,7 @@
 #include <folly/Random.h>
 #include <folly/io/async/test/MockTimeoutManager.h>
 #include <folly/io/async/test/UndelayedDestruction.h>
-#include <gtest/gtest.h>
+#include <folly/portability/GTest.h>
 #include <proxygen/lib/http/session/HTTP2PriorityQueue.h>
 
 using namespace std::placeholders;
@@ -164,6 +164,45 @@ TEST_F(QueueTest, RemoveParentWeights) {
   dump();
 
   EXPECT_EQ(nodes_, IDList({{3, 50}, {5, 50}}));
+}
+
+TEST_F(QueueTest, NodeDepth) {
+  uint64_t depth{33}; // initialize to some wrong value
+  addTransaction(1, {0, false, 15}, false, &depth);
+  EXPECT_EQ(depth, 1);
+
+  addTransaction(3, {1, false, 3}, false, &depth);
+  EXPECT_EQ(depth, 2);
+
+  addTransaction(5, {3, true, 7}, false, &depth);
+  EXPECT_EQ(depth, 3);
+
+  addTransaction(9, {1, false, 3}, true, &depth);
+  EXPECT_EQ(depth, 2);
+  EXPECT_EQ(q_.numPendingEgress(), 3);
+  EXPECT_EQ(q_.numVirtualNodes(), 1);
+
+  depth = 55; // some unlikely depth
+  addTransaction(9, {1, false, 31}, false, &depth);
+  EXPECT_EQ(depth, 2);
+  EXPECT_EQ(q_.numPendingEgress(), 4);
+  EXPECT_EQ(q_.numVirtualNodes(), 0);
+
+  addTransaction(11, {1, true, 7}, false, &depth);
+  EXPECT_EQ(depth, 2);
+  EXPECT_EQ(q_.numPendingEgress(), 5);
+  EXPECT_EQ(q_.numVirtualNodes(), 0);
+
+  addTransaction(13, {0, true, 23}, true, &depth);
+  EXPECT_EQ(depth, 1);
+  EXPECT_EQ(q_.numPendingEgress(), 5);
+  EXPECT_EQ(q_.numVirtualNodes(), 1);
+
+  depth = 77; // some unlikely depth
+  addTransaction(13, {0, true, 33}, false, &depth);
+  EXPECT_EQ(depth, 1);
+  EXPECT_EQ(q_.numPendingEgress(), 6);
+  EXPECT_EQ(q_.numVirtualNodes(), 0);
 }
 
 TEST_F(QueueTest, UpdateWeight) {
@@ -451,6 +490,25 @@ TEST_F(QueueTest, nextEgressExclusiveAddWithEgress) {
   nextEgress();
   EXPECT_EQ(nodes_, IDList({{3, 100}}));
   EXPECT_EQ(q_.numPendingEgress(), 1);
+}
+
+TEST_F(QueueTest, updatePriorityReparentSubtree) {
+  buildSimpleTree();
+
+  // clear all egress, except 9
+  signalEgress(1, false);
+  signalEgress(3, false);
+  signalEgress(5, false);
+  signalEgress(7, false);
+
+  // Update priority of non-enqueued but in egress tree node
+  updatePriority(5, {1, false, 14}, nullptr);
+
+  // update 9's weight and reparent
+  updatePriority(9, {3, false, 14}, nullptr);
+
+  nextEgress();
+  EXPECT_EQ(nodes_, IDList({{9, 100}}));
 }
 
 TEST_F(QueueTest, nextEgressRemoveParent) {
@@ -751,6 +809,13 @@ TEST_F(DanglingQueueTest, max) {
   expireNodes();
   dump();
   EXPECT_EQ(nodes_, IDList());
+}
+
+TEST_F(QueueTest, Rebuild) {
+  buildSimpleTree();
+  q_.rebuildTree();
+  dump();
+  EXPECT_EQ(nodes_, IDList({{3, 20}, {9, 20}, {5, 20}, {7, 20}, {1, 20}}));
 }
 
 }

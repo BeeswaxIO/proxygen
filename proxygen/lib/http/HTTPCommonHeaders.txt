@@ -1,3 +1,8 @@
+:Authority
+:Method
+:Path
+:Scheme
+:Status
 Accept
 Accept-Charset
 Accept-Datetime
@@ -57,6 +62,7 @@ Refresh
 Retry-After
 Server
 Set-Cookie
+Sec-Token-Binding
 Strict-Transport-Security
 TE
 Timestamp

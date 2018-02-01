@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -9,6 +9,9 @@
  */
 #include <proxygen/lib/http/session/HTTPTransactionEgressSM.h>
 
+#include <unordered_map>
+
+#include <folly/hash/Hash.h>
 #include <folly/Indestructible.h>
 
 namespace proxygen {
@@ -18,7 +21,8 @@ HTTPTransactionEgressSMData::find(HTTPTransactionEgressSMData::State s,
                                   HTTPTransactionEgressSMData::Event e) {
   using State = HTTPTransactionEgressSMData::State;
   using Event = HTTPTransactionEgressSMData::Event;
-  using TransitionTable = std::map<std::pair<State, Event>, State>;
+  using TransitionTable =
+      std::unordered_map<std::pair<State, Event>, State, folly::Hash>;
 
   //             +--> ChunkHeaderSent -> ChunkBodySent
   //             |      ^                    v

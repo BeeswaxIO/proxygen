@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -10,9 +10,10 @@
 #include <proxygen/lib/http/session/HTTPUpstreamSession.h>
 #include <proxygen/lib/http/session/HTTPSessionController.h>
 
+#include <folly/io/async/AsyncSSLSocket.h>
 #include <wangle/acceptor/ConnectionManager.h>
+#include <proxygen/lib/http/codec/HTTP2Codec.h>
 #include <proxygen/lib/http/session/HTTPTransaction.h>
-#include <proxygen/lib/http/codec/HTTPCodecFactory.h>
 
 namespace proxygen {
 
@@ -25,7 +26,6 @@ bool HTTPUpstreamSession::isReusable() const {
     << ", sock_->connecting()=" << sock_->connecting()
     << ", codec_->isReusable()=" << codec_->isReusable()
     << ", codec_->isBusy()=" << codec_->isBusy()
-    << ", pendingWriteSize_=" << pendingWriteSize_
     << ", numActiveWrites_=" << numActiveWrites_
     << ", writeTimeout_.isScheduled()=" << writeTimeout_.isScheduled()
     << ", ingressError_=" << ingressError_
@@ -67,19 +67,24 @@ void HTTPUpstreamSession::startNow() {
   HTTPSession::startNow();
   // Upstream specific:
   // create virtual priority nodes and send Priority frames to peer if necessary
-  auto bytes = codec_->addPriorityNodes(
-      txnEgressQueue_,
-      writeBuf_,
-      maxVirtualPriorityLevel_);
-  if (bytes) {
+  if (priorityMapFactory_) {
+    priorityAdapter_ = priorityMapFactory_->createVirtualStreams(this);
     scheduleWrite();
+  } else {
+    // TODO/T17420249 Move this to the PriorityAdapter and remove it from the
+    // codec.
+    auto bytes = codec_->addPriorityNodes(
+        txnEgressQueue_,
+        writeBuf_,
+        maxVirtualPriorityLevel_);
+    if (bytes) {
+      scheduleWrite();
+    }
   }
 }
 
 HTTPTransaction*
 HTTPUpstreamSession::newTransaction(HTTPTransaction::Handler* handler) {
-  CHECK_NOTNULL(handler);
-
   if (!supportsMoreTransactions() || draining_) {
     // This session doesn't support any more parallel transactions
     return nullptr;
@@ -94,21 +99,14 @@ HTTPUpstreamSession::newTransaction(HTTPTransaction::Handler* handler) {
   if (txn) {
     DestructorGuard dg(this);
     auto txnID = txn->getID();
-    txn->setHandler(handler);
+    txn->setHandler(CHECK_NOTNULL(handler));
     setNewTransactionPauseState(txnID);
   }
   return txn;
 }
 
-HTTPTransaction::Handler*
-HTTPUpstreamSession::getParseErrorHandler(HTTPTransaction* txn,
-                                          const HTTPException& error) {
-  // No special handler for upstream requests that have a parse error
-  return nullptr;
-}
-
-HTTPTransaction::Handler*
-HTTPUpstreamSession::getTransactionTimeoutHandler(HTTPTransaction* txn) {
+HTTPTransaction::Handler* HTTPUpstreamSession::getTransactionTimeoutHandler(
+    HTTPTransaction* /*txn*/) {
   // No special handler for upstream requests that time out
   return nullptr;
 }
@@ -130,10 +128,14 @@ bool HTTPUpstreamSession::onNativeProtocolUpgrade(
   VLOG(4) << *this << " onNativeProtocolUpgrade streamID=" << streamID <<
     " protocol=" << protocolString;
 
+  if (protocol != CodecProtocol::HTTP_2) {
+    return false;
+  }
+
   // Create the new Codec
-  auto codec = HTTPCodecFactory::getCodec(protocol,
-                                          TransportDirection::UPSTREAM);
-  CHECK(codec);
+  std::unique_ptr<HTTPCodec> codec =
+      std::make_unique<HTTP2Codec>(TransportDirection::UPSTREAM);
+
   bool ret = onNativeProtocolUpgradeImpl(streamID, std::move(codec),
                                          protocolString);
   if (ret) {
@@ -148,6 +150,21 @@ bool HTTPUpstreamSession::onNativeProtocolUpgrade(
   return ret;
 }
 
+void HTTPUpstreamSession::detachTransactions() {
+  while (!transactions_.empty()) {
+    auto txn = transactions_.begin();
+    detach(&txn->second);
+  }
+}
+
+bool HTTPUpstreamSession::isDetachable(bool checkSocket) const {
+  if (checkSocket && sock_ && !sock_->isDetachable()) {
+    return false;
+  }
+  return transactions_.size() == 0 && getNumIncomingStreams() == 0 &&
+    !writesPaused();
+}
+
 void
 HTTPUpstreamSession::attachThreadLocals(
   folly::EventBase* eventBase,
@@ -155,7 +172,7 @@ HTTPUpstreamSession::attachThreadLocals(
   const WheelTimerInstance& timeout,
   HTTPSessionStats* stats, FilterIteratorFn fn,
   HeaderCodec::Stats* headerCodecStats,
-  HTTPUpstreamSessionController* controller) {
+  HTTPSessionController* controller) {
   txnEgressQueue_.attachThreadLocals(timeout);
   timeout_ = timeout;
   setController(controller);
@@ -163,22 +180,24 @@ HTTPUpstreamSession::attachThreadLocals(
   if (sock_) {
     sock_->attachEventBase(eventBase);
     auto sslSocket = sock_->getUnderlyingTransport<folly::AsyncSSLSocket>();
-    if (sslSocket) {
+    if (sslSocket && sslContext) {
       sslSocket->attachSSLContext(sslContext);
     }
   }
   codec_.foreach(fn);
   codec_->setHeaderCodecStats(headerCodecStats);
   resumeReadsImpl();
+  rescheduleLoopCallbacks();
 }
 
 void
-HTTPUpstreamSession::detachThreadLocals() {
+HTTPUpstreamSession::detachThreadLocals(bool detachSSLContext) {
   CHECK(transactions_.empty());
+  cancelLoopCallbacks();
   pauseReadsImpl();
   if (sock_) {
     auto sslSocket = sock_->getUnderlyingTransport<folly::AsyncSSLSocket>();
-    if (sslSocket) {
+    if (sslSocket && detachSSLContext) {
       sslSocket->detachSSLContext();
     }
     sock_->detachEventBase();
@@ -189,6 +208,10 @@ HTTPUpstreamSession::detachThreadLocals() {
   // The codec filters *shouldn't* be accessible while the socket is detached,
   // I hope
   codec_->setHeaderCodecStats(nullptr);
+  auto cm = getConnectionManager();
+  if (cm) {
+    cm->removeConnection(this);
+  }
 }
 
 

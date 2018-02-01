@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -11,7 +11,7 @@
 
 #include <fstream>
 #include <glog/logging.h>
-#include <gtest/gtest.h>
+#include <folly/portability/GTest.h>
 #include <proxygen/lib/http/codec/compress/Logging.h>
 
 using folly::IOBuf;
@@ -35,7 +35,7 @@ void dumpToFile(const string& filename, const IOBuf* buf) {
 }
 
 unique_ptr<IOBuf> encodeDecode(
-    vector<HPACKHeader> headers,
+    vector<HPACKHeader>& headers,
     HPACKEncoder& encoder,
     HPACKDecoder& decoder) {
   unique_ptr<IOBuf> encoded = encoder.encode(headers);

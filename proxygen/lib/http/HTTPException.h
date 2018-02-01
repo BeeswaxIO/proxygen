@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -53,7 +53,7 @@ class HTTPException : public proxygen::Exception {
       currentIngressBuf_ = ex.currentIngressBuf_->clone();
     }
     if (ex.partialMsg_) {
-      partialMsg_ = folly::make_unique<HTTPMessage>(*ex.partialMsg_.get());
+      partialMsg_ = std::make_unique<HTTPMessage>(*ex.partialMsg_.get());
     }
   }
 

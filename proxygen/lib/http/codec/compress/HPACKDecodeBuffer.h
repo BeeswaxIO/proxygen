@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -10,6 +10,7 @@
 #pragma once
 
 #include <folly/Conv.h>
+#include <folly/FBString.h>
 #include <folly/io/Cursor.h>
 #include <folly/io/IOBuf.h>
 #include <proxygen/lib/http/codec/compress/HPACKConstants.h>
@@ -76,7 +77,7 @@ class HPACKDecodeBuffer {
   /**
    * decode a literal starting from the current position
    */
-  HPACK::DecodeError decodeLiteral(std::string& literal);
+  HPACK::DecodeError decodeLiteral(folly::fbstring& literal);
 
 private:
   const huffman::HuffTree& huffmanTree_;

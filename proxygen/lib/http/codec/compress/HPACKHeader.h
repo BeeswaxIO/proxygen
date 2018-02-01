@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -12,6 +12,8 @@
 #include <folly/Conv.h>
 #include <ostream>
 #include <string>
+#include <proxygen/lib/http/codec/compress/HPACKHeaderName.h>
+#include <folly/FBString.h>
 
 namespace proxygen {
 
@@ -21,9 +23,19 @@ class HPACKHeader {
 
   HPACKHeader() {}
 
-  HPACKHeader(const std::string& name_,
-             const std::string& value_):
-    name(name_), value(value_) {}
+  HPACKHeader(folly::StringPiece name_,
+              folly::StringPiece value_):
+      name(name_), value(value_.data(), value_.size()) {}
+
+  HPACKHeader(HPACKHeader&& goner) noexcept
+      : name(std::move(goner.name)),
+        value(std::move(goner.value)) {}
+
+  HPACKHeader& operator=(HPACKHeader&& goner) noexcept {
+    std::swap(name, goner.name);
+    std::swap(value, goner.value);
+    return *this;
+  }
 
   ~HPACKHeader() {}
 
@@ -37,7 +49,6 @@ class HPACKHeader {
   bool operator==(const HPACKHeader& other) const {
     return name == other.name && value == other.value;
   }
-
   bool operator<(const HPACKHeader& other) const {
     bool eqname = (name == other.name);
     if (!eqname) {
@@ -45,7 +56,6 @@ class HPACKHeader {
     }
     return value < other.value;
   }
-
   bool operator>(const HPACKHeader& other) const {
     bool eqname = (name == other.name);
     if (!eqname) {
@@ -61,21 +71,8 @@ class HPACKHeader {
     return !value.empty();
   }
 
-  /**
-   * Decide if we will add the current header into the header table
-   *
-   * This is a way to blacklist some headers that have variable values and are
-   * not efficient to index, like a :path with URL params, content-length or
-   * headers that contain timestamps: if-modified-since, last-modified.
-   * This is not standard for HPACK and it's part of some heuristics used by
-   * the encoder to improve the use of the header table.
-   *
-   * @return true if we should index the header
-   */
-  bool isIndexable() const;
-
-  std::string name;
-  std::string value;
+  HPACKHeaderName name;
+  folly::fbstring value;
 };
 
 std::ostream& operator<<(std::ostream& os, const HPACKHeader& h);

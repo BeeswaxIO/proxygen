@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -59,8 +59,9 @@ void PassThroughHTTPCodecFilter::onFrameHeader(
     uint32_t stream_id,
     uint8_t flags,
     uint32_t length,
+    uint8_t type,
     uint16_t version) {
-  callback_->onFrameHeader(stream_id, flags, length, version);
+  callback_->onFrameHeader(stream_id, flags, length, type, version);
 }
 
 void PassThroughHTTPCodecFilter::onError(
@@ -125,8 +126,16 @@ uint32_t PassThroughHTTPCodecFilter::numIncomingStreams() const {
 }
 
 // PassThroughHTTPCodec methods
+HPACKTableInfo PassThroughHTTPCodecFilter::getHPACKTableInfo() const {
+  return call_->getHPACKTableInfo();
+}
+
 CodecProtocol PassThroughHTTPCodecFilter::getProtocol() const {
   return call_->getProtocol();
+}
+
+const std::string& PassThroughHTTPCodecFilter::getUserAgent() const {
+  return call_->getUserAgent();
 }
 
 TransportDirection PassThroughHTTPCodecFilter::getTransportDirection() const {

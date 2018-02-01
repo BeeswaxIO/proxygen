@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -23,6 +23,7 @@ class Exception : public std::exception {
  public:
   explicit Exception(std::string const& msg);
   Exception(const Exception&);
+  Exception(Exception& other) : Exception(folly::as_const(other)) {} // @nolint
   Exception(Exception&&) noexcept;
 
   template <typename... Args>

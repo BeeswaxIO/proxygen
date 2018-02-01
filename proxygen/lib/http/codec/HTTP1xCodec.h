@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -28,6 +28,11 @@ class HTTP1xCodec : public HTTPCodec {
   CodecProtocol getProtocol() const override {
     return CodecProtocol::HTTP_1_1;
   }
+
+  const std::string& getUserAgent() const override {
+    return userAgent_;
+  }
+
   TransportDirection getTransportDirection() const override {
     return transportDirection_;
   }
@@ -149,6 +154,7 @@ class HTTP1xCodec : public HTTPCodec {
   folly::StringPiece currentHeaderNameStringPiece_;
   std::string currentHeaderValue_;
   std::string url_;
+  std::string userAgent_;
   std::string reason_;
   std::string upgradeHeader_; // last sent/received client upgrade header
   std::string allowedNativeUpgrades_; // DOWNSTREAM only

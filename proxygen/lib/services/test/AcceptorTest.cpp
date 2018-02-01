@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -10,7 +10,7 @@
 #include <wangle/acceptor/Acceptor.h>
 #include <folly/io/async/EventBase.h>
 #include <glog/logging.h>
-#include <gtest/gtest.h>
+#include <folly/portability/GTest.h>
 
 using namespace folly;
 using namespace wangle;
@@ -18,14 +18,14 @@ using namespace wangle;
 class TestConnection : public wangle::ManagedConnection {
  public:
   void timeoutExpired() noexcept override {}
-  void describe(std::ostream& os) const override {}
+  void describe(std::ostream& /*os*/) const override {}
   bool isBusy() const override { return false; }
   void notifyPendingShutdown() override {}
   void closeWhenIdle() override {}
   void dropConnection() override {
     delete this;
   }
-  void dumpConnectionState(uint8_t loglevel) override {}
+  void dumpConnectionState(uint8_t /*loglevel*/) override {}
 };
 
 class TestAcceptor : public Acceptor {
@@ -33,11 +33,11 @@ class TestAcceptor : public Acceptor {
   explicit TestAcceptor(const ServerSocketConfig& accConfig)
       : Acceptor(accConfig) {}
 
-  void onNewConnection(folly::AsyncTransportWrapper::UniquePtr sock,
-                       const folly::SocketAddress* address,
-                       const std::string& nextProtocolName,
-                       SecureTransportType secureTransportType,
-                       const TransportInfo& tinfo) override {
+  void onNewConnection(folly::AsyncTransportWrapper::UniquePtr /*sock*/,
+                       const folly::SocketAddress* /*address*/,
+                       const std::string& /*nextProtocolName*/,
+                       SecureTransportType /*secureTransportType*/,
+                       const TransportInfo& /*tinfo*/) override {
     addConnection(new TestConnection);
 
     getEventBase()->terminateLoopSoon();

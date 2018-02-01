@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -66,14 +66,13 @@ void RequestHandlerAdaptor::onBody(std::unique_ptr<folly::IOBuf> c) noexcept {
   upstream_->onBody(std::move(c));
 }
 
-void RequestHandlerAdaptor::onChunkHeader(size_t length) noexcept {
-}
+void RequestHandlerAdaptor::onChunkHeader(size_t /*length*/) noexcept {}
 
 void RequestHandlerAdaptor::onChunkComplete() noexcept {
 }
 
-void RequestHandlerAdaptor::onTrailers(std::unique_ptr<HTTPHeaders> trailers)
-    noexcept {
+void RequestHandlerAdaptor::onTrailers(
+    std::unique_ptr<HTTPHeaders> /*trailers*/) noexcept {
   // XXX: Support trailers
 }
 
@@ -173,7 +172,7 @@ ResponseHandler* RequestHandlerAdaptor::newPushedResponse(
   auto pushTxn = txn_->newPushedTransaction(pushHandler->getHandler());
   if (!pushTxn) {
     // Codec doesn't support push
-    return nullptr;;
+    return nullptr;
   }
   auto pushHandlerAdaptor = new RequestHandlerAdaptor(pushHandler);
   pushHandlerAdaptor->setTransaction(pushTxn);

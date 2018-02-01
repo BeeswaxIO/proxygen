@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -41,7 +41,7 @@ HTTPDownstreamSession::setupOnHeadersComplete(HTTPTransaction* txn,
 
   // In the general case, delegate to the handler factory to generate
   // a handler for the transaction.
-  handler = controller_->getRequestHandler(*txn, msg);
+  handler = getController()->getRequestHandler(*txn, msg);
   CHECK(handler);
 
   DestructorGuard dg(this);
@@ -51,16 +51,9 @@ HTTPDownstreamSession::setupOnHeadersComplete(HTTPTransaction* txn,
 }
 
 HTTPTransaction::Handler*
-HTTPDownstreamSession::getParseErrorHandler(HTTPTransaction* txn,
-                                            const HTTPException& error) {
-  // we encounter an error before we finish reading the ingress headers.
-  return controller_->getParseErrorHandler(txn, error, localAddr_);
-}
-
-HTTPTransaction::Handler*
 HTTPDownstreamSession::getTransactionTimeoutHandler(
   HTTPTransaction* txn) {
-  return controller_->getTransactionTimeoutHandler(txn, localAddr_);
+  return getController()->getTransactionTimeoutHandler(txn, getLocalAddress());
 }
 
 void
@@ -126,6 +119,7 @@ HTTPDownstreamSession::onNativeProtocolUpgrade(
     switchingProtos.setStatusCode(101);
     switchingProtos.setStatusMessage("Switching Protocols");
     switchingProtos.getHeaders().set(HTTP_HEADER_UPGRADE, protocolString);
+    switchingProtos.getHeaders().set(HTTP_HEADER_CONNECTION, "Upgrade");
     txn->sendHeaders(switchingProtos);
     // no sendEOM for 1xx
 

@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -41,6 +41,13 @@ enum HTTPHeaderCode : uint8_t {
 
 };
 
+const uint8_t HTTPHeaderCodeCommonOffset = 2;
+
+enum HTTPCommonHeaderTableType: uint8_t {
+  TABLE_CAMELCASE = 0,
+  TABLE_LOWERCASE = 1,
+};
+
 class HTTPCommonHeaders {
  public:
   // Perfect hash function to match common HTTP header names
@@ -50,14 +57,41 @@ class HTTPCommonHeaders {
     return hash(name.data(), name.length());
   }
 
-  FB_EXPORT static std::string* initHeaderNames();
+  FB_EXPORT static std::string* initHeaderNames(HTTPCommonHeaderTableType type);
 $$$$$
 
-  inline static const std::string* getPointerToHeaderName(HTTPHeaderCode code) {
-    static const auto headerNames = initHeaderNames();
+  static const std::string* getPointerToCommonHeaderTable(
+    HTTPCommonHeaderTableType type);
 
-    return headerNames + code;
+  inline static const std::string* getPointerToHeaderName(HTTPHeaderCode code,
+      HTTPCommonHeaderTableType type = TABLE_CAMELCASE) {
+    return getPointerToCommonHeaderTable(type) + code;
   }
+
+  inline static bool isHeaderNameFromTable(const std::string* headerName,
+      HTTPCommonHeaderTableType type) {
+    return getHeaderCodeFromTableCommonHeaderName(headerName, type) >=
+      HTTPHeaderCodeCommonOffset;
+  }
+
+  // This method supplements hash().  If dealing with string pointers, some
+  // pointing to entries in the the common header name table and some not, this
+  // method can be used in place of hash to reverse map a string from the common
+  // header name table to its HTTPHeaderCode
+  inline static HTTPHeaderCode getHeaderCodeFromTableCommonHeaderName(
+      const std::string* headerName, HTTPCommonHeaderTableType type) {
+    if (headerName == nullptr) {
+      return HTTP_HEADER_NONE;
+    } else {
+      auto diff = headerName - getPointerToCommonHeaderTable(type);
+      if (diff >= HTTPHeaderCodeCommonOffset && diff < (long)num_header_codes) {
+        return static_cast<HTTPHeaderCode>(diff);
+      } else {
+        return HTTP_HEADER_OTHER;
+      }
+    }
+  }
+
 };
 
 } // proxygen

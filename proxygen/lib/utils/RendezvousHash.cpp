@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -8,9 +8,8 @@
  *
  */
 #include <proxygen/lib/utils/RendezvousHash.h>
-#include <folly/Foreach.h>
-#include <folly/Hash.h>
-#include <glog/logging.h>
+#include <folly/container/Foreach.h>
+#include <folly/hash/Hash.h>
 #include <map>
 #include <algorithm>
 #include <vector>

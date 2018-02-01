@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -10,7 +10,6 @@
 #pragma once
 
 #include <wangle/ssl/SSLContextConfig.h>
-#include <folly/io/async/AsyncServerSocket.h>
 #include <folly/io/async/EventBase.h>
 #include <wangle/bootstrap/ServerBootstrap.h>
 #include <proxygen/httpserver/HTTPServerOptions.h>
@@ -63,7 +62,7 @@ class HTTPServer final {
     /*
      * Whether to allow an insecure connection on a secure port.
      * This should be used in very few cases where a HTTP server needs to
-     * support insecure and secure connections.
+     * support insecure and secure connections on the same address.
      */
     bool allowInsecureConnectionsOnSecureServer{false};
     bool enableTCPFastOpen{false};
@@ -71,6 +70,13 @@ class HTTPServer final {
      * Maximum queue size of pending fast open connections.
      */
     uint32_t fastOpenQueueSize{10000};
+
+    /*
+     * Determines if this server does strict checking when loading SSL contexts.
+     */
+    bool strictSSL{true};
+
+    folly::Optional<folly::AsyncSocket::OptionMap> acceptorSocketOptions;
   };
 
   /**
@@ -80,17 +86,14 @@ class HTTPServer final {
   ~HTTPServer();
 
   /**
-   * Bind server to the following addresses. Can be called from any thread.
+   * Configure server to bind to the following addresses.
    *
-   * Throws exception on error (say port is already busy). You can try binding
-   * to different set of ports. Though once it succeeds, it is a FATAL to call
-   * it again.
+   * Actual bind happens in `start` function.
    *
-   * The list is updated in-place to contain final port server bound to if
-   * ephemeral port was given. If the call fails, the list might be partially
-   * updated.
+   * Can be called from any thread.
    */
-  void bind(std::vector<IPConfig>& addrs);
+  void bind(std::vector<IPConfig>&& addrs);
+  void bind(std::vector<IPConfig> const& addrs);
 
   /**
    * Start HTTPServer.
@@ -114,15 +117,16 @@ class HTTPServer final {
    * You must still invoke stop() before destroying the server.
    * You do NOT need to invoke this before calling stop().
    * This can be called from any thread, and it is idempotent.
-   * The only restriction is it should be called after start() has completed.
+   * However, it may only be called **after** start() has called onSuccess.
    */
   void stopListening();
 
   /**
    * Stop HTTPServer.
    *
-   * Can be called from any thread. Server will stop listening for new
-   * connections and will wait for running requests to finish.
+   * Can be called from any thread, but only after start() has called
+   * onSuccess.  Server will stop listening for new connections and will
+   * wait for running requests to finish.
    *
    * TODO: Separate method to do hard shutdown?
    */
@@ -149,6 +153,11 @@ class HTTPServer final {
    * Returns a file descriptor associated with the listening socket
    */
   int getListenSocket() const;
+
+  /**
+   * Re-reads the certificate / key pair for all SSL vips on all acceptors
+   */
+  void updateTLSCredentials();
 
   /**
    * Updates ticket seeds for the HTTPServer for all the VIPs.

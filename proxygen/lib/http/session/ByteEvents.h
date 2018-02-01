@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -23,6 +23,7 @@ class ByteEvent {
     LAST_BYTE,
     PING_REPLY_SENT,
     FIRST_HEADER_BYTE,
+    TRACKED_BYTE,
   };
 
   ByteEvent(uint64_t byteOffset, EventType eventType)

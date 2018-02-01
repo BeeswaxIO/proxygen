@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -14,15 +14,20 @@
 #include <proxygen/lib/utils/ConsistentHash.h>
 
 namespace proxygen {
-
+/*
+ * Weighted Rendezvous Hash is a way to consistently route requests to
+ * candidates.
+ * Unlike ConsistentHash, Weighted Rendezvous Hash supports the action to
+ * reduce the relative weight of a candidate while incurring minimum data
+ * movement.
+ */
 class RendezvousHash : public ConsistentHash {
  public:
+  double getMaxErrorRate() const override;
 
-  double getMaxErrorRate() const;
+  void build(std::vector<std::pair<std::string, uint64_t>>&) override;
 
-  void build(std::vector<std::pair<std::string, uint64_t> >&);
-
-  size_t get(const uint64_t key, const size_t rank = 0) const;
+  size_t get(const uint64_t key, const size_t rank = 0) const override;
 
  private:
   uint64_t computeHash(const char* data, size_t len) const;

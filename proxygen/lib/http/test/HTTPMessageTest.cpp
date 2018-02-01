@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -8,18 +8,13 @@
  *
  */
 #include <fcntl.h>
-#include <gtest/gtest.h>
-#include <list>
+#include <folly/portability/GTest.h>
 #include <proxygen/lib/http/HTTPMessage.h>
 #include <proxygen/lib/utils/TestUtils.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
-
-#include <folly/portability/Libgen.h>
-#include <folly/portability/Sockets.h>
-#include <folly/portability/Unistd.h>
 
 using namespace proxygen;
 using namespace std;
@@ -205,7 +200,7 @@ TEST(HTTPMessage, TestProxification) {
   msg.setWantsKeepalive(false);
 
   HTTPHeaders& hdrs = msg.getHeaders();
-  EXPECT_EQ("192.168.1.1", hdrs.getSingleOrEmpty("Host"));
+  EXPECT_EQ("192.168.1.1", hdrs.getSingleOrEmpty(HTTP_HEADER_HOST));
   EXPECT_FALSE(msg.wantsKeepalive());
 }
 
@@ -225,95 +220,103 @@ TEST(HTTPMessage, TestKeepaliveCheck) {
   {
     HTTPMessage msg;
     msg.setHTTPVersion(1, 1);
-    msg.getHeaders().add("Connection", "close");
+    msg.getHeaders().add(HTTP_HEADER_CONNECTION, "close");
     EXPECT_FALSE(msg.computeKeepalive());
   }
 
   {
     HTTPMessage msg;
     msg.setHTTPVersion(1, 1);
-    msg.getHeaders().add("Connection", "ClOsE");
+    msg.getHeaders().add(HTTP_HEADER_CONNECTION, "ClOsE");
     EXPECT_FALSE(msg.computeKeepalive());
   }
 
   {
     HTTPMessage msg;
     msg.setHTTPVersion(1, 1);
-    msg.getHeaders().add("Connection", "foo,bar");
+    msg.getHeaders().add(HTTP_HEADER_CONNECTION, "foo,bar");
     EXPECT_TRUE(msg.computeKeepalive());
   }
 
   {
     HTTPMessage msg;
     msg.setHTTPVersion(1, 1);
-    msg.getHeaders().add("Connection", "foo,bar");
-    msg.getHeaders().add("Connection", "abc,CLOSE,def");
-    msg.getHeaders().add("Connection", "xyz");
+    msg.getHeaders().add(HTTP_HEADER_CONNECTION, "foo,bar");
+    msg.getHeaders().add(HTTP_HEADER_CONNECTION, "abc,CLOSE,def");
+    msg.getHeaders().add(HTTP_HEADER_CONNECTION, "xyz");
     EXPECT_FALSE(msg.computeKeepalive());
   }
 
   {
     HTTPMessage msg;
     msg.setHTTPVersion(1, 1);
-    msg.getHeaders().add("Connection", "foo,bar");
-    msg.getHeaders().add("Connection", "abc ,  CLOSE , def");
-    msg.getHeaders().add("Connection", "xyz");
+    msg.getHeaders().add(HTTP_HEADER_CONNECTION, "foo,bar");
+    msg.getHeaders().add(HTTP_HEADER_CONNECTION, "abc ,  CLOSE , def");
+    msg.getHeaders().add(HTTP_HEADER_CONNECTION, "xyz");
     EXPECT_FALSE(msg.computeKeepalive());
   }
 
   {
     HTTPMessage msg;
     msg.setHTTPVersion(1, 1);
-    msg.getHeaders().add("Connection", "  close ");
+    msg.getHeaders().add(HTTP_HEADER_CONNECTION, "  close ");
     EXPECT_FALSE(msg.computeKeepalive());
   }
 
   {
     HTTPMessage msg;
     msg.setHTTPVersion(1, 1);
-    msg.getHeaders().add("Connection", ",  close ");
+    msg.getHeaders().add(HTTP_HEADER_CONNECTION, ",  close ");
     EXPECT_FALSE(msg.computeKeepalive());
   }
 
   {
     HTTPMessage msg;
     msg.setHTTPVersion(1, 1);
-    msg.getHeaders().add("Connection", "  close , ");
+    msg.getHeaders().add(HTTP_HEADER_CONNECTION, "  close , ");
     EXPECT_FALSE(msg.computeKeepalive());
   }
 
   {
     HTTPMessage msg;
     msg.setHTTPVersion(1, 0);
-    msg.getHeaders().add("Connection", "Keep-Alive");
+    msg.getHeaders().add(HTTP_HEADER_CONNECTION, "Keep-Alive");
     EXPECT_TRUE(msg.computeKeepalive());
   }
 
   {
     HTTPMessage msg;
     msg.setHTTPVersion(1, 0);
-    msg.getHeaders().add("Connection", "keep-alive");
+    msg.getHeaders().add(HTTP_HEADER_CONNECTION, "keep-alive");
     EXPECT_TRUE(msg.computeKeepalive());
   }
 
   {
     HTTPMessage msg;
     msg.setHTTPVersion(1, 0);
-    msg.getHeaders().add("Connection", "keep-alive");
-    msg.getHeaders().add("Connection", "close");
+    msg.getHeaders().add(HTTP_HEADER_CONNECTION, "keep-alive");
+    msg.getHeaders().add(HTTP_HEADER_CONNECTION, "close");
     EXPECT_FALSE(msg.computeKeepalive());
+  }
+
+  {
+    HTTPMessage msg;
+    msg.setHTTPVersion(1, 0);
+    msg.getHeaders().add(HTTP_HEADER_CONNECTION, "keep-alive");
+    msg.stripPerHopHeaders();
+    EXPECT_TRUE(msg.computeKeepalive());
   }
 }
 
 TEST(HTTPMessage, TestHeaderStripPerHop) {
   HTTPMessage msg;
 
-  msg.getHeaders().add("Connection", "a, b, c");
-  msg.getHeaders().add("Connection", "d");
-  msg.getHeaders().add("Connection", ",,,,");
-  msg.getHeaders().add("Connection", " , , , ,");
-  msg.getHeaders().add("Connection", ", e");
-  msg.getHeaders().add("Connection", " f ,\tg\t, \r\n\th ");
+  msg.getHeaders().add(HTTP_HEADER_CONNECTION, "a, b, c");
+  msg.getHeaders().add(HTTP_HEADER_CONNECTION, "d");
+  msg.getHeaders().add(HTTP_HEADER_CONNECTION, ",,,,");
+  msg.getHeaders().add(HTTP_HEADER_CONNECTION, " , , , ,");
+  msg.getHeaders().add(HTTP_HEADER_CONNECTION, ", e");
+  msg.getHeaders().add(HTTP_HEADER_CONNECTION, " f ,\tg\t, \r\n\th ");
   msg.getHeaders().add("Keep-Alive", "true");
 
   msg.getHeaders().add("a", "1");
@@ -379,6 +382,32 @@ TEST(HTTPHeaders, AddStringPiece) {
   folly::StringPiece name = str.split_step(':');
   headers.add(name, str);
   EXPECT_EQ("value", headers.getSingleOrEmpty("name"));
+}
+
+TEST(HTTPHeaders, InitializerList) {
+  HTTPHeaders hdrs;
+
+  hdrs.add({{"name", "value"}});
+  hdrs.add({{HTTP_HEADER_CONNECTION, "close"}});
+  hdrs.add({{"a", "b"},
+            {HTTP_HEADER_CONNECTION, "foo"},
+            {HTTP_HEADER_SERVER, "x"}});
+
+  EXPECT_EQ("value", hdrs.getSingleOrEmpty("name"));
+  EXPECT_EQ("close, foo", hdrs.combine(HTTP_HEADER_CONNECTION));
+  EXPECT_EQ("x", hdrs.getSingleOrEmpty(HTTP_HEADER_SERVER));
+}
+
+TEST(HTTPHeaders, InitializerListStringPiece) {
+  HTTPHeaders hdrs;
+
+  const char* foo = "name:value";
+  folly::StringPiece str(foo);
+  folly::StringPiece name = str.split_step(':');
+  hdrs.add({{name, str}, {HTTP_HEADER_CONNECTION, str}});
+
+  EXPECT_EQ("value", hdrs.getSingleOrEmpty("name"));
+  EXPECT_EQ("value", hdrs.getSingleOrEmpty(HTTP_HEADER_CONNECTION));
 }
 
 void testRemoveQueryParam(const string& url,

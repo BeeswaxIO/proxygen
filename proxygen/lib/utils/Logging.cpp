@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -11,10 +11,11 @@
 
 #include <folly/Format.h>
 #include <folly/Memory.h>
+#include <folly/Singleton.h>
 #include <folly/String.h>
 #include <fstream>
-#include <iostream>
 #include <memory>
+#include <ostream>
 #include <sstream>
 #include <vector>
 #include <sys/stat.h>
@@ -152,6 +153,12 @@ void dumpBinToFile(const string& filename, const IOBuf* buf) {
   file.close();
   LOG(INFO) << "wrote chain " << IOBufPrinter::printChainInfo(buf)
             << " to " << filename;
+}
+
+namespace logging_details {
+std::string getStackTrace() {
+  return folly::SingletonVault::stackTraceGetter().load()();
+}
 }
 
 }

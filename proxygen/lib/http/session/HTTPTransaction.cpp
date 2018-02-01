@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -12,10 +12,10 @@
 #include <algorithm>
 #include <folly/Conv.h>
 #include <folly/io/async/EventBaseManager.h>
+#include <folly/tracing/ScopedTraceSection.h>
 #include <glog/logging.h>
 #include <proxygen/lib/http/HTTPHeaderSize.h>
 #include <proxygen/lib/http/RFC2616.h>
-#include <proxygen/lib/http/codec/SPDYConstants.h>
 #include <proxygen/lib/http/session/HTTPSessionStats.h>
 
 using folly::IOBuf;
@@ -66,7 +66,8 @@ HTTPTransaction::HTTPTransaction(TransportDirection direction,
     inActiveSet_(true),
     ingressErrorSeen_(false),
     priorityFallback_(false),
-    headRequest_(false) {
+    headRequest_(false),
+    enableLastByteFlushedTracking_(false) {
 
   if (assocStreamId_) {
     if (isUpstream()) {
@@ -153,25 +154,29 @@ void HTTPTransaction::onIngressHeadersComplete(
         !headRequest_ &&
         !RFC2616::responseBodyMustBeEmpty(msg->getStatusCode()))) {
     // CONNECT payload has no defined semantics
-    const auto& clHeader =
+    const auto& contentLen =
       msg->getHeaders().getSingleOrEmpty(HTTP_HEADER_CONTENT_LENGTH);
-    if (!clHeader.empty()) {
+    if (!contentLen.empty()) {
       try {
-        expectedContentLengthRemaining_ = folly::to<uint64_t>(clHeader);
+        expectedContentLengthRemaining_ = folly::to<uint64_t>(contentLen);
       } catch (const folly::ConversionError& ex) {
-        // ignore this, at least for now
+        LOG(ERROR) << "Invalid content-length: " << contentLen <<
+          ", ex=" << ex.what() << *this;
       }
     }
   }
   if (transportCallback_) {
     transportCallback_->headerBytesReceived(msg->getIngressHeaderSize());
   }
+  if (transport_.getCodec().getProtocol() == CodecProtocol::HTTP_2) {
+    updateIngressHPACKTableInfo(transport_.getCodec().getHPACKTableInfo());
+  }
   if (mustQueueIngress()) {
     checkCreateDeferredIngress();
     deferredIngress_->emplace(id_, HTTPEvent::Type::HEADERS_COMPLETE,
                              std::move(msg));
-    VLOG(4) << *this << " Queued ingress event of type " <<
-      HTTPEvent::Type::HEADERS_COMPLETE;
+    VLOG(4) << "Queued ingress event of type "
+            << HTTPEvent::Type::HEADERS_COMPLETE << " " << *this;
   } else {
     processIngressHeadersComplete(std::move(msg));
   }
@@ -191,6 +196,7 @@ void HTTPTransaction::processIngressHeadersComplete(
 
 void HTTPTransaction::onIngressBody(unique_ptr<IOBuf> chain,
                                     uint16_t padding) {
+  FOLLY_SCOPED_TRACE_SECTION("HTTPTransaction - onIngressBody");
   DestructorGuard g(this);
   if (isIngressEOMSeen()) {
     sendAbort(ErrorCode::STREAM_CLOSED);
@@ -214,7 +220,7 @@ void HTTPTransaction::onIngressBody(unique_ptr<IOBuf> chain,
           len,
           " expecting no more than ",
           expectedContentLengthRemaining_.value());
-      LOG(ERROR) << *this << " " << errorMsg;
+      LOG(ERROR) << errorMsg << " " << *this;
       if (handler_) {
         HTTPException ex(HTTPException::Direction::INGRESS, errorMsg);
         ex.setProxygenError(kErrorParseBody);
@@ -226,28 +232,33 @@ void HTTPTransaction::onIngressBody(unique_ptr<IOBuf> chain,
   if (transportCallback_) {
     transportCallback_->bodyBytesReceived(len);
   }
-  if (mustQueueIngress()) {
-    // register the bytes in the receive window
-    if (!recvWindow_.reserve(len + padding, useFlowControl_)) {
-      LOG(ERROR) << *this << " recvWindow_.reserve failed with len=" << len <<
-        " padding=" << padding << " capacity=" << recvWindow_.getCapacity() <<
-        " outstanding=" << recvWindow_.getOutstanding();
-      sendAbort(ErrorCode::FLOW_CONTROL_ERROR);
-    } else {
-      CHECK(recvWindow_.free(padding));
-      recvToAck_ += padding;
-      checkCreateDeferredIngress();
-      deferredIngress_->emplace(id_, HTTPEvent::Type::BODY,
-                               std::move(chain));
-      VLOG(4) << *this << " Queued ingress event of type " <<
-        HTTPEvent::Type::BODY << " size=" << len;
-    }
+  // register the bytes in the receive window
+  if (!recvWindow_.reserve(len + padding, useFlowControl_)) {
+    LOG(ERROR) << "recvWindow_.reserve failed with len=" << len
+               << " padding=" << padding
+               << " capacity=" << recvWindow_.getCapacity()
+               << " outstanding=" << recvWindow_.getOutstanding()
+               << " " << *this ;
+    sendAbort(ErrorCode::FLOW_CONTROL_ERROR);
+    return;
   } else {
+    CHECK(recvWindow_.free(padding));
+    recvToAck_ += padding;
+  }
+  if (mustQueueIngress()) {
+    checkCreateDeferredIngress();
+    deferredIngress_->emplace(id_, HTTPEvent::Type::BODY,
+                              std::move(chain));
+    VLOG(4) << "Queued ingress event of type " << HTTPEvent::Type::BODY
+            << " size=" << len << " " << *this;
+  } else {
+    CHECK(recvWindow_.free(len));
     processIngressBody(std::move(chain), len);
   }
 }
 
 void HTTPTransaction::processIngressBody(unique_ptr<IOBuf> chain, size_t len) {
+  FOLLY_SCOPED_TRACE_SECTION("HTTPTransaction - processIngressBody");
   DestructorGuard g(this);
   if (aborted_) {
     return;
@@ -284,8 +295,8 @@ void HTTPTransaction::onIngressChunkHeader(size_t length) {
   if (mustQueueIngress()) {
     checkCreateDeferredIngress();
     deferredIngress_->emplace(id_, HTTPEvent::Type::CHUNK_HEADER, length);
-    VLOG(4) << *this << " Queued ingress event of type " <<
-      HTTPEvent::Type::CHUNK_HEADER << " size=" << length;
+    VLOG(4) << "Queued ingress event of type " << HTTPEvent::Type::CHUNK_HEADER
+            << " size=" << length << " " << *this;
   } else {
     processIngressChunkHeader(length);
   }
@@ -310,8 +321,8 @@ void HTTPTransaction::onIngressChunkComplete() {
   if (mustQueueIngress()) {
     checkCreateDeferredIngress();
     deferredIngress_->emplace(id_, HTTPEvent::Type::CHUNK_COMPLETE);
-    VLOG(4) << *this << " Queued ingress event of type " <<
-      HTTPEvent::Type::CHUNK_COMPLETE;
+    VLOG(4) << "Queued ingress event of type "
+            << HTTPEvent::Type::CHUNK_COMPLETE << " " << *this;
   } else {
     processIngressChunkComplete();
   }
@@ -337,8 +348,8 @@ void HTTPTransaction::onIngressTrailers(unique_ptr<HTTPHeaders> trailers) {
     checkCreateDeferredIngress();
     deferredIngress_->emplace(id_, HTTPEvent::Type::TRAILERS_COMPLETE,
         std::move(trailers));
-    VLOG(4) << *this << " Queued ingress event of type " <<
-      HTTPEvent::Type::TRAILERS_COMPLETE;
+    VLOG(4) << "Queued ingress event of type "
+            << HTTPEvent::Type::TRAILERS_COMPLETE << " " << *this;
   } else {
     processIngressTrailers(std::move(trailers));
   }
@@ -363,8 +374,8 @@ void HTTPTransaction::onIngressUpgrade(UpgradeProtocol protocol) {
   if (mustQueueIngress()) {
     checkCreateDeferredIngress();
     deferredIngress_->emplace(id_, HTTPEvent::Type::UPGRADE, protocol);
-    VLOG(4) << *this << " Queued ingress event of type " <<
-      HTTPEvent::Type::UPGRADE;
+    VLOG(4) << "Queued ingress event of type " << HTTPEvent::Type::UPGRADE
+            << " " << *this;
   } else {
     processIngressUpgrade(protocol);
   }
@@ -391,7 +402,7 @@ void HTTPTransaction::onIngressEOM() {
     auto errorMsg = folly::to<std::string>(
         "Content-Length/body mismatch: expecting another ",
         expectedContentLengthRemaining_.value());
-    LOG(ERROR) << *this << " " << errorMsg;
+    LOG(ERROR) << errorMsg << " " << *this;
     if (handler_) {
       HTTPException ex(HTTPException::Direction::INGRESS, errorMsg);
       ex.setProxygenError(kErrorParseBody);
@@ -417,8 +428,8 @@ void HTTPTransaction::onIngressEOM() {
   if (mustQueueIngress()) {
     checkCreateDeferredIngress();
     deferredIngress_->emplace(id_, HTTPEvent::Type::MESSAGE_COMPLETE);
-    VLOG(4) << *this << " Queued ingress event of type " <<
-      HTTPEvent::Type::MESSAGE_COMPLETE;
+    VLOG(4) << "Queued ingress event of type "
+            << HTTPEvent::Type::MESSAGE_COMPLETE << " " << *this;
   } else {
     processIngressEOM();
   }
@@ -516,8 +527,8 @@ void HTTPTransaction::onError(const HTTPException& error) {
     // we got an ingress error, we've seen the entire message, but we're
     // expecting more (window updates).  These aren't coming, convert to
     // INGRESS_AND_EGRESS
-    VLOG(4) << *this << " Converting ingress error to ingress+egress due to"
-      " flow control, and aborting";
+    VLOG(4) << "Converting ingress error to ingress+egress due to"
+      " flow control, and aborting " << *this;
     direction = HTTPException::Direction::INGRESS_AND_EGRESS;
     sendAbort(ErrorCode::FLOW_CONTROL_ERROR);
   }
@@ -576,6 +587,18 @@ void HTTPTransaction::onError(const HTTPException& error) {
   }
 }
 
+void HTTPTransaction::onGoaway(ErrorCode code) {
+  DestructorGuard g(this);
+  VLOG(4) << "received GOAWAY notification on " << *this;
+  // This callback can be received at any time and does not affect this
+  // transaction's ingress or egress state machines. If it would have
+  // affected this transaction's state, we would have received onError()
+  // instead.
+  if (handler_) {
+    handler_->onGoaway(code);
+  }
+}
+
 void HTTPTransaction::onIngressTimeout() {
   DestructorGuard g(this);
   VLOG(4) << "ingress timeout on " << *this;
@@ -606,14 +629,15 @@ void HTTPTransaction::onIngressWindowUpdate(const uint32_t amount) {
     return;
   }
   DestructorGuard g(this);
-  VLOG(4) << *this << " Remote side ack'd " << amount << " bytes";
+  VLOG(4) << "Remote side ack'd " << amount << " bytes " << *this ;
   updateReadTimeout();
   if (sendWindow_.free(amount)) {
     notifyTransportPendingEgress();
   } else {
-    LOG(ERROR) << *this << "sendWindow_.free failed with amount=" << amount <<
-      " capacity=" << sendWindow_.getCapacity() <<
-      " outstanding=" << sendWindow_.getOutstanding();
+    LOG(ERROR) << "sendWindow_.free failed with amount=" << amount
+               << " capacity=" << sendWindow_.getCapacity()
+               << " outstanding=" << sendWindow_.getOutstanding()
+               << " " << *this;
     sendAbort(ErrorCode::FLOW_CONTROL_ERROR);
   }
 }
@@ -626,9 +650,10 @@ void HTTPTransaction::onIngressSetSendWindow(const uint32_t newWindowSize) {
   if (sendWindow_.setCapacity(newWindowSize)) {
     notifyTransportPendingEgress();
   } else {
-    LOG(ERROR) << *this << "sendWindow_.setCapacity failed with newWindowSize="
+    LOG(ERROR) << "sendWindow_.setCapacity failed with newWindowSize="
                << newWindowSize << " capacity=" << sendWindow_.getCapacity()
-               << " outstanding=" << sendWindow_.getOutstanding();
+               << " outstanding=" << sendWindow_.getOutstanding()
+               << " " << *this;
     sendAbort(ErrorCode::FLOW_CONTROL_ERROR);
   }
 }
@@ -667,6 +692,13 @@ void HTTPTransaction::onEgressBodyLastByte() {
   }
 }
 
+void HTTPTransaction::onEgressTrackedByte() {
+  DestructorGuard g(this);
+  if (transportCallback_) {
+    transportCallback_->trackedByteFlushed();
+  }
+}
+
 void HTTPTransaction::onEgressLastByteAck(std::chrono::milliseconds latency) {
   DestructorGuard g(this);
   if (transportCallback_) {
@@ -686,10 +718,26 @@ void HTTPTransaction::sendHeadersWithOptionalEOM(
   if (headers.isRequest()) {
     headRequest_ = (headers.getMethod() == HTTPMethod::HEAD);
   }
+
+  if (headers.isResponse()) {
+    const auto& contentLen =
+      headers.getHeaders().getSingleOrEmpty(HTTP_HEADER_CONTENT_LENGTH);
+    if (!contentLen.empty()) {
+      try {
+        expectedResponseLength_ = folly::to<uint64_t>(contentLen);
+      } catch (const folly::ConversionError& ex) {
+        LOG(ERROR) << "Invalid content-length: " << contentLen <<
+          ", ex=" << ex.what() << *this;
+      }
+    }
+  }
   HTTPHeaderSize size;
   transport_.sendHeaders(this, headers, &size, eom);
   if (transportCallback_) {
     transportCallback_->headerBytesGenerated(size);
+  }
+  if (transport_.getCodec().getProtocol() == CodecProtocol::HTTP_2) {
+    updateEgressHPACKTableInfo(transport_.getCodec().getHPACKTableInfo());
   }
   if (eom) {
     CHECK(HTTPTransactionEgressSM::transit(
@@ -717,9 +765,14 @@ void HTTPTransaction::sendBody(std::unique_ptr<folly::IOBuf> body) {
   DestructorGuard guard(this);
   CHECK(HTTPTransactionEgressSM::transit(
       egressState_, HTTPTransactionEgressSM::Event::sendBody));
-  if (body && isEnqueued()) {
+
+  if (body) {
     size_t bodyLen = body->computeChainDataLength();
-    transport_.notifyEgressBodyBuffered(bodyLen);
+    actualResponseLength_ = actualResponseLength_.value() + bodyLen;
+
+    if (isEnqueued()) {
+      transport_.notifyEgressBodyBuffered(bodyLen);
+    }
   }
   deferredEgressBody_.append(std::move(body));
   notifyTransportPendingEgress();
@@ -728,6 +781,9 @@ void HTTPTransaction::sendBody(std::unique_ptr<folly::IOBuf> body) {
 bool HTTPTransaction::onWriteReady(const uint32_t maxEgress, double ratio) {
   DestructorGuard g(this);
   DCHECK(isEnqueued());
+  if (prioritySample_) {
+    updateRelativeWeight(ratio);
+  }
   cumulativeRatio_ += ratio;
   egressCalls_++;
   sendDeferredBody(maxEgress);
@@ -844,7 +900,7 @@ bool HTTPTransaction::maybeDelayForRateLimit() {
   if (requiredDelay > kRateLimitMaxDelay) {
     // The delay should never be this long
     VLOG(4) << "ratelim: Required delay too long (" << requiredDelay.count()
-      << "ms), ignoring";
+            << "ms), ignoring";
     return false;
   }
 
@@ -888,11 +944,12 @@ size_t HTTPTransaction::sendBodyNow(std::unique_ptr<folly::IOBuf> body,
   if (useFlowControl_) {
     CHECK(sendWindow_.reserve(bodyLen));
   }
-  VLOG(4) << *this << " Sending " << bodyLen << " bytes of body. eom="
+  VLOG(4) << "Sending " << bodyLen << " bytes of body. eom="
           << ((sendEom) ? "yes" : "no") << " send_window is "
           << ( useFlowControl_ ?
                folly::to<std::string>(sendWindow_.getSize(), " / ",
-                                      sendWindow_.getCapacity()) : noneStr);
+                                      sendWindow_.getCapacity()) : noneStr)
+          << " " << *this;
   if (sendEom) {
     CHECK(HTTPTransactionEgressSM::transit(
             egressState_, HTTPTransactionEgressSM::Event::eomFlushed));
@@ -908,7 +965,11 @@ size_t HTTPTransaction::sendBodyNow(std::unique_ptr<folly::IOBuf> body,
     return 0;
   }
   updateReadTimeout();
-  nbytes = transport_.sendBody(this, std::move(body), sendEom);
+  nbytes = transport_.sendBody(
+    this, std::move(body), sendEom, enableLastByteFlushedTracking_);
+  if (isPrioritySampled()) {
+    updateTransactionBytesSent(bodyLen);
+  }
   if (egressLimitBytesPerMs_ > 0) {
     numLimitedBytesEgressed_ += nbytes;
   }
@@ -921,6 +982,14 @@ HTTPTransaction::sendEOM() {
   CHECK(HTTPTransactionEgressSM::transit(
       egressState_, HTTPTransactionEgressSM::Event::sendEOM))
     << ", " << *this;
+  if (expectedResponseLength_ && actualResponseLength_
+      && (*expectedResponseLength_ != *actualResponseLength_)) {
+    auto errorMsg = folly::to<std::string>(
+        "Content-Length/body mismatch: expected= ", *expectedResponseLength_,
+        ", actual= ", *actualResponseLength_);
+    LOG(ERROR) << errorMsg << " " << *this;
+  }
+
   if (deferredEgressBody_.chainLength() == 0 && chunkHeaders_.empty()) {
     // there is nothing left to send, egress the EOM directly.  For SPDY
     // this will jump the txn queue
@@ -935,15 +1004,15 @@ HTTPTransaction::sendEOM() {
       // should take care of sending the EOM.
       // Nevertheless we never expect this condition to occur,
       // so, log.
-      LOG(ERROR) << "Queued egress EOM with no body on "
-        << *this
-        << "[egressState=" << egressState_ << ", "
-        << "ingressState=" << ingressState_ << ", "
-        << "egressPaused=" << egressPaused_ << ", "
-        << "ingressPaused=" << ingressPaused_ << ", "
-        << "aborted=" << aborted_ << ", "
-        << "enqueued=" << isEnqueued() << ", "
-        << "chainLength=" << deferredEgressBody_.chainLength() << "]";
+      LOG(ERROR) << "Queued egress EOM with no body"
+                 << "[egressState=" << egressState_ << ", "
+                 << "ingressState=" << ingressState_ << ", "
+                 << "egressPaused=" << egressPaused_ << ", "
+                 << "ingressPaused=" << ingressPaused_ << ", "
+                 << "aborted=" << aborted_ << ", "
+                 << "enqueued=" << isEnqueued() << ", "
+                 << "chainLength=" << deferredEgressBody_.chainLength() << "]"
+                 << " on " << *this;
     }
   } else {
     VLOG(4) << "Queued egress EOM on " << *this;
@@ -977,11 +1046,10 @@ void HTTPTransaction::sendAbort(ErrorCode statusCode) {
 }
 
 void HTTPTransaction::pauseIngress() {
-  VLOG(4) << *this << " pauseIngress request";
+  VLOG(4)<< "pauseIngress request " << *this;
   DestructorGuard g(this);
   if (ingressPaused_) {
-    VLOG(4) << *this << " can't pause ingress; ingressPaused=" <<
-        ingressPaused_;
+    VLOG(4) << "can't pause ingress; ingressPaused=" << ingressPaused_;
     return;
   }
   ingressPaused_ = true;
@@ -990,18 +1058,18 @@ void HTTPTransaction::pauseIngress() {
 }
 
 void HTTPTransaction::resumeIngress() {
-  VLOG(4) << *this << " resumeIngress request";
+  VLOG(4) << "resumeIngress request " << *this;
   DestructorGuard g(this);
   if (!ingressPaused_ || isIngressComplete()) {
-    VLOG(4) << *this << " can't resume ingress; ingressPaused="
-            << ingressPaused_ << ", ingressComplete="
-            << isIngressComplete() << " inResume_=" << inResume_;
+    VLOG(4) << "can't resume ingress, ingressPaused=" << ingressPaused_
+            << ", ingressComplete=" << isIngressComplete()
+            << ", inResume_=" << inResume_ << " " << *this;
     return;
   }
   ingressPaused_ = false;
   transport_.resumeIngress(this);
   if (inResume_) {
-    VLOG(4) << *this << " skipping recursive resume loop";
+    VLOG(4) << "skipping recursive resume loop " << *this;
     return;
   }
   inResume_ = true;
@@ -1016,8 +1084,8 @@ void HTTPTransaction::resumeIngress() {
   // the transaction.
   while (!ingressPaused_ && deferredIngress_ && !deferredIngress_->empty()) {
     HTTPEvent& callback(deferredIngress_->front());
-    VLOG(5) << *this << " Processing deferred ingress callback of type " <<
-      callback.getEvent();
+    VLOG(5) << "Processing deferred ingress callback of type "
+            << callback.getEvent() << " " << *this;
     switch (callback.getEvent()) {
       case HTTPEvent::Type::MESSAGE_BEGIN:
         LOG(FATAL) << "unreachable";
@@ -1056,10 +1124,10 @@ void HTTPTransaction::resumeIngress() {
 }
 
 void HTTPTransaction::pauseEgress() {
-  VLOG(4) << *this << " asked to pause egress";
+  VLOG(4) << "asked to pause egress " << *this ;
   DestructorGuard g(this);
   if (egressPaused_) {
-    VLOG(4) << *this << " egress already paused";
+    VLOG(4) << "egress already paused " << *this ;
     return;
   }
   egressPaused_ = true;
@@ -1067,10 +1135,10 @@ void HTTPTransaction::pauseEgress() {
 }
 
 void HTTPTransaction::resumeEgress() {
-  VLOG(4) << *this << " asked to resume egress";
+  VLOG(4) << "asked to resume egress" << *this;
   DestructorGuard g(this);
   if (!egressPaused_) {
-    VLOG(4) << *this << " egress already not paused";
+    VLOG(4) << "egress already not paused" << *this;
     return;
   }
   egressPaused_ = false;
@@ -1113,9 +1181,18 @@ void HTTPTransaction::notifyTransportPendingEgress() {
 void HTTPTransaction::updateHandlerPauseState() {
   int64_t availWindow =
     sendWindow_.getSize() - deferredEgressBody_.chainLength();
+  // do not count transaction stalled if no more bytes to send,
+  // i.e. when availWindow == 0
+  if (useFlowControl_ && availWindow < 0 && !flowControlPaused_) {
+    VLOG(4) << "transaction stalled by flow control" << *this;
+    if (stats_) {
+      stats_->recordTransactionStalled();
+    }
+  }
   flowControlPaused_ = useFlowControl_ && availWindow <= 0;
   bool handlerShouldBePaused = egressPaused_ || flowControlPaused_ ||
     egressRateLimited_;
+
   if (handler_ && handlerShouldBePaused != handlerEgressPaused_) {
     if (handlerShouldBePaused) {
       handlerEgressPaused_ = true;
@@ -1127,13 +1204,35 @@ void HTTPTransaction::updateHandlerPauseState() {
   }
 }
 
+void HTTPTransaction::updateIngressHPACKTableInfo(HPACKTableInfo tableInfo) {
+    tableInfo_.ingressHeaderTableSize_ =
+                            tableInfo.ingressHeaderTableSize_;
+    tableInfo_.ingressBytesStored_ =
+                            tableInfo.ingressBytesStored_;
+    tableInfo_.ingressHeadersStored_ =
+                            tableInfo.ingressHeadersStored_;
+}
+
+void HTTPTransaction::updateEgressHPACKTableInfo(HPACKTableInfo tableInfo) {
+  tableInfo_.egressHeaderTableSize_ =
+                            tableInfo.egressHeaderTableSize_;
+  tableInfo_.egressBytesStored_ =
+                            tableInfo.egressBytesStored_;
+  tableInfo_.egressHeadersStored_ =
+                            tableInfo.egressHeadersStored_;
+}
+
+HPACKTableInfo& HTTPTransaction::getHPACKTableInfo() {
+  return tableInfo_;
+}
+
 bool HTTPTransaction::mustQueueIngress() const {
   return ingressPaused_ || (deferredIngress_ && !deferredIngress_->empty());
 }
 
 void HTTPTransaction::checkCreateDeferredIngress() {
   if (!deferredIngress_) {
-    deferredIngress_ = folly::make_unique<std::queue<HTTPEvent>>();
+    deferredIngress_ = std::make_unique<std::queue<HTTPEvent>>();
   }
 }
 
@@ -1141,12 +1240,12 @@ bool HTTPTransaction::onPushedTransaction(HTTPTransaction* pushTxn) {
   DestructorGuard g(this);
   CHECK_EQ(pushTxn->assocStreamId_, id_);
   if (!handler_) {
-    VLOG(1) << "Cannot add a pushed txn to an unhandled txn";
+    VLOG(4) << "Cannot add a pushed txn to an unhandled txn";
     return false;
   }
   handler_->onPushedTransaction(pushTxn);
   if (!pushTxn->getHandler()) {
-    VLOG(1) << "Failed to create a handler for push transaction";
+    VLOG(4) << "Failed to create a handler for push transaction";
     return false;
   }
   pushedTransactions_.insert(pushTxn->getID());
@@ -1165,7 +1264,7 @@ void HTTPTransaction::setIdleTimeout(
 
 void HTTPTransaction::describe(std::ostream& os) const {
   transport_.describe(os);
-  os << " streamID=" << id_;
+  os << ", streamID=" << id_;
 }
 
 /*
@@ -1176,6 +1275,9 @@ void HTTPTransaction::describe(std::ostream& os) const {
 void HTTPTransaction::setReceiveWindow(uint32_t capacity) {
   // Depending on whether delta is positive or negative it will cause the
   // window to either increase or decrease.
+  if (!useFlowControl_) {
+    return;
+  }
   int32_t delta = capacity - recvWindow_.getCapacity();
   if (delta < 0) {
     // For now, we're disallowing shrinking the window, since it can lead
@@ -1192,13 +1294,13 @@ void HTTPTransaction::setReceiveWindow(uint32_t capacity) {
 
 void HTTPTransaction::flushWindowUpdate() {
 
-  if (recvToAck_ > 0 &&
+  if (recvToAck_ > 0 && useFlowControl_ && !isIngressEOMSeen() &&
       (direction_ == TransportDirection::DOWNSTREAM ||
        egressState_ != HTTPTransactionEgressSM::State::Start)) {
     // Down egress upstream window updates until after headers
-    VLOG(4) << *this << " recv_window is " << recvWindow_.getSize()
+    VLOG(4) << "recv_window is " << recvWindow_.getSize()
             << " / " << recvWindow_.getCapacity() << " after acking "
-            << recvToAck_;
+            << recvToAck_ << " " << *this ;
     transport_.sendWindowUpdate(this, recvToAck_);
     recvToAck_ = 0;
   }
@@ -1240,5 +1342,165 @@ void HTTPTransaction::onPriorityUpdate(const http2::PriorityUpdate& priority) {
     priorityFallback_ = true;
   }
 }
+
+class HTTPTransaction::PrioritySample {
+  struct WeightedAccumulator {
+    void accumulate(uint64_t weighted, uint64_t total) {
+      weighted_ += weighted;
+      total_ += total;
+    }
+
+    void accumulateWeighted(uint64_t weighted) {
+      weighted_ += weighted;
+    }
+
+    void accumulateTotal(uint64_t total) {
+      total_ += total;
+    }
+
+    double getWeightedAverage() const {
+      return total_ ? (double)weighted_ / (double)total_ : 0;
+    }
+  private:
+    uint64_t weighted_{0};
+    uint64_t total_{0};
+  };
+
+  struct WeightedValue {
+    uint64_t value_{0};
+
+    void accumulateByTransactionBytes(uint64_t bytes) {
+      byTransactionBytesSent_.accumulate(value_ * bytes, bytes);
+    }
+
+    void accumulateBySessionBytes(uint64_t bytes) {
+      bySessionBytesScheduled_.accumulate(value_ * bytes, bytes);
+    }
+
+    void getSummary(HTTPTransaction::PrioritySampleSummary::WeightedAverage&
+                    wa) const {
+      wa.byTransactionBytes_ =
+        byTransactionBytesSent_.getWeightedAverage();
+      wa.bySessionBytes_ =
+        bySessionBytesScheduled_.getWeightedAverage();
+    }
+  private:
+    WeightedAccumulator byTransactionBytesSent_;
+    WeightedAccumulator bySessionBytesScheduled_;
+  };
+
+public:
+  explicit PrioritySample(HTTPTransaction* tnx) :
+    tnx_(tnx),
+    transactionBytesScheduled_(false) {}
+
+  void updateContentionsCount(uint64_t contentions, uint64_t depth) {
+    transactionBytesScheduled_ = false;
+    ratio_ = 0.0;
+    contentions_.value_ = contentions;
+    depth_.value_ = depth;
+  }
+
+  void updateTransactionBytesSent(uint64_t bytes) {
+    transactionBytesScheduled_ = true;
+    measured_weight_.accumulateWeighted(bytes);
+    if (contentions_.value_) {
+      contentions_.accumulateByTransactionBytes(bytes);
+    } else {
+      VLOG(5) << "transfer " << bytes
+              << " transaction body bytes while contentions count = 0 "
+              << *tnx_;
+    }
+    depth_.accumulateByTransactionBytes(bytes);
+  }
+
+  void updateSessionBytesSheduled(uint64_t bytes) {
+    measured_weight_.accumulateTotal(bytes);
+    expected_weight_.accumulate((ratio_ * bytes) + 0.5, bytes);
+    if (contentions_.value_) {
+      contentions_.accumulateBySessionBytes(bytes);
+    } else {
+      VLOG(5) << "transfer " << bytes
+              << " session body bytes while contentions count = 0 "
+              << *tnx_;
+    }
+    depth_.accumulateBySessionBytes(bytes);
+  }
+
+  void updateRatio(double ratio) {
+    ratio_ = ratio;
+  }
+
+  bool isTransactionBytesScheduled() const {
+    return transactionBytesScheduled_;
+  }
+
+  void getSummary(HTTPTransaction::PrioritySampleSummary& summary) const {
+    contentions_.getSummary(summary.contentions_);
+    depth_.getSummary(summary.depth_);
+    summary.expected_weight_ = expected_weight_.getWeightedAverage();
+    summary.measured_weight_ = measured_weight_.getWeightedAverage();
+  }
+private:
+  // TODO: remove tnx_ when not needed
+  HTTPTransaction* tnx_; // needed for error reporting, will be removed
+  WeightedValue contentions_;
+  WeightedValue depth_;
+  WeightedAccumulator expected_weight_;
+  WeightedAccumulator measured_weight_;
+  double ratio_;
+  bool transactionBytesScheduled_:1;
+};
+
+void HTTPTransaction::setPrioritySampled(bool sampled) {
+  if (sampled) {
+    prioritySample_ = std::make_unique<PrioritySample>(this);
+  } else {
+    prioritySample_.reset();
+  }
+}
+
+void HTTPTransaction::updateContentionsCount(uint64_t contentions) {
+  CHECK(prioritySample_);
+  prioritySample_->updateContentionsCount(contentions,
+                                          queueHandle_->calculateDepth(false));
+}
+
+void HTTPTransaction::updateRelativeWeight(double ratio) {
+  CHECK(prioritySample_);
+  prioritySample_->updateRatio(ratio);
+}
+
+void HTTPTransaction::updateSessionBytesSheduled(uint64_t bytes) {
+  CHECK(prioritySample_);
+  // Do not accumulate session bytes utill header is sent.
+  // Otherwise, the session bytes could be accumulated for a transaction
+  // that is not allowed to egress yet.
+  // Do not accumulate session bytes if transaction is paused.
+  // On the other hand, if the transaction is part of the egress,
+  // always accumulate the session bytes.
+  if ((bytes && firstHeaderByteSent_ && !egressPaused_ &&
+    !egressRateLimited_ && !flowControlPaused_)
+    || prioritySample_->isTransactionBytesScheduled()) {
+    prioritySample_->updateSessionBytesSheduled(bytes);
+  }
+}
+
+void HTTPTransaction::updateTransactionBytesSent(uint64_t bytes) {
+  CHECK(prioritySample_);
+  if (bytes) {
+    prioritySample_->updateTransactionBytesSent(bytes);
+  }
+}
+
+bool HTTPTransaction::getPrioritySampleSummary(
+      HTTPTransaction::PrioritySampleSummary& summary) const {
+  if (prioritySample_) {
+    prioritySample_->getSummary(summary);
+    return true;
+  }
+  return false;
+}
+
 
 } // proxygen

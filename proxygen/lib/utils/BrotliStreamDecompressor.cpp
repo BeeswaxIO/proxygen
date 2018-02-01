@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -8,8 +8,8 @@
  *
  */
 #include <proxygen/lib/utils/BrotliStreamDecompressor.h>
+
 #include <folly/io/Cursor.h>
-#include <iostream>
 
 static const size_t kFileBufferSize = 65536;
 

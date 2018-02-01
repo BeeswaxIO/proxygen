@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -18,6 +18,21 @@
 
 namespace proxygen {
 
+class TableImpl {
+ public:
+  virtual ~TableImpl() {}
+  virtual void init(size_t capacity) = 0;
+  virtual size_t size() const = 0;
+  virtual HPACKHeader& operator[] (size_t i) = 0;
+  virtual void resize(size_t size) = 0;
+  virtual void moveItems(size_t oldTail, size_t oldLength,
+                         size_t newLength) = 0;
+  virtual void add(size_t head, const HPACKHeaderName& name,
+                   const folly::fbstring& value, int32_t epoch) = 0;
+  virtual bool isValidEpoch(uint32_t i, int32_t commitEpoch,
+                            int32_t curEpoch) = 0;
+};
+
 /**
  * Data structure for maintaining indexed headers, based on a fixed-length ring
  * with FIFO semantics. Externally it acts as an array.
@@ -25,35 +40,59 @@ namespace proxygen {
 
 class HeaderTable {
  public:
+  typedef std::unordered_map<HPACKHeaderName, std::list<uint32_t>> names_map;
 
-  typedef std::unordered_map<std::string, std::list<uint32_t>> names_map;
-
-  explicit HeaderTable(uint32_t capacityVal) {
+  HeaderTable(std::unique_ptr<TableImpl> table, uint32_t capacityVal)
+      : table_(std::move(table)) {
     init(capacityVal);
   }
-  HeaderTable() {}
 
   ~HeaderTable() {}
+  HeaderTable(const HeaderTable&) = delete;
+  HeaderTable& operator=(const HeaderTable&) = delete;
 
   /**
    * Initialize with a given capacity.
    */
   void init(uint32_t capacityVal);
 
+  void setAbsoluteIndexing(bool absoluteIndexing) {
+    CHECK_EQ(readBaseIndex_, -1) << "Attempted to change indexing scheme after "
+      "encoding has started";
+    if (absoluteIndexing) {
+      readBaseIndex_ = 0;
+      writeBaseIndex_ = 0;
+    } else {
+      readBaseIndex_ = -1;
+      writeBaseIndex_ = -1;
+    }
+  }
+
+  int64_t markBaseIndex() {
+    readBaseIndex_ = writeBaseIndex_;
+    return writeBaseIndex_;
+  }
+
+  void setBaseIndex(int64_t baseIndex) {
+    readBaseIndex_ = baseIndex;
+    writeBaseIndex_ = baseIndex;
+  }
+
   /**
-   * Add the header entry at the beginning of the table (index=1) and add the
-   * index to the reference set.
+   * Add the header entry at the beginning of the table (index=1)
    *
    * @return true if it was able to add the entry
    */
   bool add(const HPACKHeader& header);
+  bool add(const HPACKHeader& header, int32_t epoch, bool& eviction);
 
   /**
    * Get the index of the given header, if found.
    *
    * @return 0 in case the header is not found
    */
-  uint32_t getIndex(const HPACKHeader& header) const;
+  uint32_t getIndex(const HPACKHeader& header, int32_t commitEpoch = -1,
+                    int32_t curEpoch = -1) const;
 
   /**
    * Get the table entry at the given index.
@@ -70,13 +109,10 @@ class HeaderTable {
   /**
    * @return true if there is at least one header with the given name
    */
-  bool hasName(const std::string& name);
+  bool hasName(const HPACKHeaderName& headerName);
 
   /**
    * @return the map holding the indexed names
-   *
-   * Note: this contains references to internal indices, so it's useful only
-   * for testing or instrumentation.
    */
   const names_map& names() const {
     return names_;
@@ -87,48 +123,8 @@ class HeaderTable {
    * headers with the given name we pick the last one added to the header
    * table, but the way we pick the header can be arbitrary.
    */
-  uint32_t nameIndex(const std::string& name) const;
-
-  /**
-   * Clear new references set
-   */
-  void clearSkippedReferences();
-
-  /**
-   * Tests whether the given index is a new reference.
-   */
-  bool isSkippedReference(uint32_t index) const;
-
-  /**
-   * Keep record of the given entry as a skipped reference.
-   */
-  void addSkippedReference(uint32_t index);
-
-  /**
-   * Check if a given index is part of the reference set.
-   */
-  bool inReferenceSet(uint32_t index) const;
-
-  /**
-   * Add index to the reference set.
-   */
-  void addReference(uint32_t index);
-
-  /**
-   * Remove index from the reference set.
-   */
-  void removeReference(uint32_t index);
-
-  /**
-   * Create a list with all the indices that are in the reference set. The
-   * caller will have ownership on the returned list.
-   */
-  std::list<uint32_t> referenceSet() const;
-
-  /**
-   * Remove all indices from the reference set.
-   */
-  void clearReferenceSet();
+  uint32_t nameIndex(const HPACKHeaderName& headerName, int32_t commitEpoch=-1,
+                     int32_t curEpoch=-1) const;
 
   /**
    * Table capacity, or maximum number of bytes we can hold.
@@ -136,6 +132,12 @@ class HeaderTable {
   uint32_t capacity() const {
     return capacity_;
   }
+
+  /**
+  * Returns the maximum table length required to support HPACK headers given
+  * the specified capacity bytes
+  */
+  uint32_t getMaxTableLength(uint32_t capacityVal);
 
   /**
    * Sets the current capacity of the header table, and evicts entries
@@ -161,7 +163,7 @@ class HeaderTable {
    * @return how many slots we have in the table
    */
   size_t length() const {
-    return table_.size();
+    return table_->size();
   }
 
   bool operator==(const HeaderTable& other) const;
@@ -176,7 +178,11 @@ class HeaderTable {
                              uint32_t externalIndex);
 
  private:
-  HeaderTable& operator=(const HeaderTable&); // non-copyable
+
+  /*
+   * Increase table length to newLength
+   */
+  void increaseTableLengthTo(uint32_t newLength);
 
   /**
    * Removes one header entry from the beginning of the header table.
@@ -184,9 +190,14 @@ class HeaderTable {
   void removeLast();
 
   /**
+   * Empties the underlying header table
+   */
+  void reset();
+
+  /**
    * Evict entries to make space for the needed amount of bytes.
    */
-  uint32_t evict(uint32_t needed);
+  uint32_t evict(uint32_t needed, uint32_t desiredCapacity);
 
   /**
    * Move the index to the right.
@@ -210,14 +221,14 @@ class HeaderTable {
 
   uint32_t capacity_{0};
   uint32_t bytes_{0};     // size in bytes of the current entries
-  std::vector<HPACKHeader> table_;
+  std::unique_ptr<TableImpl> table_;
 
   uint32_t size_{0};    // how many entries we have in the table
   uint32_t head_{0};     // points to the first element of the ring
 
   names_map names_;
-  std::unordered_set<uint32_t> refset_;
-  std::unordered_set<uint32_t> skippedRefs_;
+  int64_t readBaseIndex_{-1};
+  int64_t writeBaseIndex_{-1};
 };
 
 std::ostream& operator<<(std::ostream& os, const HeaderTable& table);

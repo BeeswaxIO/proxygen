@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -9,13 +9,11 @@
  */
 #include <proxygen/lib/http/HTTPMessage.h>
 
-#include <array>
 #include <boost/algorithm/string.hpp>
 #include <folly/Format.h>
 #include <folly/Range.h>
 #include <folly/SingletonThreadLocal.h>
 #include <string>
-#include <utility>
 #include <vector>
 
 using folly::IOBuf;
@@ -91,7 +89,7 @@ HTTPMessage::HTTPMessage(const HTTPMessage& message) :
     queryParams_(message.queryParams_),
     version_(message.version_),
     headers_(message.headers_),
-    strippedPerHopHeaders_(message.headers_),
+    strippedPerHopHeaders_(message.strippedPerHopHeaders_),
     sslVersion_(message.sslVersion_),
     sslCipher_(message.sslCipher_),
     protoStr_(message.protoStr_),
@@ -105,8 +103,37 @@ HTTPMessage::HTTPMessage(const HTTPMessage& message) :
     trailersAllowed_(message.trailersAllowed_),
     secure_(message.secure_) {
   if (message.trailers_) {
-    trailers_.reset(new HTTPHeaders(*message.trailers_.get()));
+    trailers_ = std::make_unique<HTTPHeaders>(*message.trailers_);
   }
+}
+
+HTTPMessage::HTTPMessage(HTTPMessage&& message) noexcept :
+    startTime_(message.startTime_),
+    seqNo_(message.seqNo_),
+    dstAddress_(std::move(message.dstAddress_)),
+    dstIP_(std::move(message.dstIP_)),
+    dstPort_(message.dstPort_),
+    localIP_(std::move(message.localIP_)),
+    versionStr_(std::move(message.versionStr_)),
+    fields_(std::move(message.fields_)),
+    cookies_(std::move(message.cookies_)),
+    queryParams_(std::move(message.queryParams_)),
+    version_(message.version_),
+    headers_(std::move(message.headers_)),
+    strippedPerHopHeaders_(std::move(message.strippedPerHopHeaders_)),
+    trailers_(std::move(message.trailers_)),
+    sslVersion_(message.sslVersion_),
+    sslCipher_(message.sslCipher_),
+    protoStr_(message.protoStr_),
+    pri_(message.pri_),
+    h2Pri_(message.h2Pri_),
+    parsedCookies_(message.parsedCookies_),
+    parsedQueryParams_(message.parsedQueryParams_),
+    chunked_(message.chunked_),
+    upgraded_(message.upgraded_),
+    wantsKeepalive_(message.wantsKeepalive_),
+    trailersAllowed_(message.trailersAllowed_),
+    secure_(message.secure_) {
 }
 
 HTTPMessage& HTTPMessage::operator=(const HTTPMessage& message) {
@@ -125,7 +152,7 @@ HTTPMessage& HTTPMessage::operator=(const HTTPMessage& message) {
   queryParams_ = message.queryParams_;
   version_ = message.version_;
   headers_ = message.headers_;
-  strippedPerHopHeaders_ = message.headers_;
+  strippedPerHopHeaders_ = message.strippedPerHopHeaders_;
   sslVersion_ = message.sslVersion_;
   sslCipher_ = message.sslCipher_;
   protoStr_ = message.protoStr_;
@@ -140,10 +167,44 @@ HTTPMessage& HTTPMessage::operator=(const HTTPMessage& message) {
   secure_ = message.secure_;
 
   if (message.trailers_) {
-    trailers_.reset(new HTTPHeaders(*message.trailers_.get()));
+    trailers_ = std::make_unique<HTTPHeaders>(*message.trailers_);
   } else {
     trailers_.reset();
   }
+  return *this;
+}
+
+HTTPMessage& HTTPMessage::operator=(HTTPMessage&& message) {
+  if (&message == this) {
+    return *this;
+  }
+  startTime_ = message.startTime_;
+  seqNo_ = message.seqNo_;
+  dstAddress_ = std::move(message.dstAddress_);
+  dstIP_ = std::move(message.dstIP_);
+  dstPort_ = message.dstPort_;
+  localIP_ = std::move(message.localIP_);
+  versionStr_ = std::move(message.versionStr_);
+  fields_ = std::move(message.fields_);
+  cookies_ = std::move(message.cookies_);
+  queryParams_ = std::move(message.queryParams_);
+  version_ = message.version_;
+  headers_ = std::move(message.headers_);
+  strippedPerHopHeaders_ = std::move(message.strippedPerHopHeaders_);
+  sslVersion_ = message.sslVersion_;
+  sslCipher_ = message.sslCipher_;
+  protoStr_ = message.protoStr_;
+  pri_ = message.pri_;
+  h2Pri_ = message.h2Pri_;
+  parsedCookies_ = message.parsedCookies_;
+  parsedQueryParams_ = message.parsedQueryParams_;
+  chunked_ = message.chunked_;
+  upgraded_ = message.upgraded_;
+  wantsKeepalive_ = message.wantsKeepalive_;
+  trailersAllowed_ = message.trailersAllowed_;
+  secure_ = message.secure_;
+
+  trailers_ = std::move(message.trailers_);
   return *this;
 }
 
@@ -254,9 +315,8 @@ struct FormattedDate {
 
 string HTTPMessage::formatDateHeader() {
   struct DateTag {};
-  static folly::SingletonThreadLocal<FormattedDate, DateTag> s_formattedDate{};
-
-  return s_formattedDate.get().formatDate();
+  auto& obj = folly::SingletonThreadLocal<FormattedDate, DateTag>::get();
+  return obj.formatDate();
 }
 
 void HTTPMessage::ensureHostHeader() {
@@ -328,13 +388,16 @@ void HTTPMessage::parseCookies() const {
   });
 }
 
-void HTTPMessage::unparseCookies() {
+void HTTPMessage::unparseCookies() const {
   cookies_.clear();
   parsedCookies_ = false;
 }
 
 const StringPiece HTTPMessage::getCookie(const string& name) const {
+ // clear previous parsed cookies.  They might store raw pointers to a vector
+  // in headers_, which can resize on add()
   // Parse the cookies if we haven't done so yet
+  unparseCookies();
   if (!parsedCookies_) {
     parseCookies();
   }
@@ -641,7 +704,14 @@ void HTTPMessage::dumpMessage(int vlogLevel) const {
     VLOG(vlogLevel) << " " << stripCntrlChars(h) << ": "
                     << stripCntrlChars(v);
   });
-}
+  if (strippedPerHopHeaders_.size() > 0) {
+    VLOG(vlogLevel) << "Per-Hop Headers";
+    strippedPerHopHeaders_.forEach([&] (const string& h, const string& v) {
+        VLOG(vlogLevel) << " " << stripCntrlChars(h) << ": "
+                        << stripCntrlChars(v);
+      });
+  }
+ }
 
 void
 HTTPMessage::atomicDumpMessage(int vlogLevel) const {
@@ -717,10 +787,16 @@ bool HTTPMessage::computeKeepalive() const {
     return false;
   }
 
+  const std::string kKeepAliveConnToken = "keep-alive";
   if (version_ == kHTTPVersion10) {
       // HTTP 1.0 persistent connections require a Connection: Keep-Alive
       // header to be present for the connection to be persistent.
-      if (checkForHeaderToken(HTTP_HEADER_CONNECTION, "keep-alive", false)) {
+      if (checkForHeaderToken(
+              HTTP_HEADER_CONNECTION, kKeepAliveConnToken.c_str(), false) ||
+          doHeaderTokenCheck(strippedPerHopHeaders_,
+                             HTTP_HEADER_CONNECTION,
+                             kKeepAliveConnToken.c_str(),
+                             false)) {
         return true;
       }
       return false;
@@ -733,6 +809,13 @@ bool HTTPMessage::computeKeepalive() const {
 bool HTTPMessage::checkForHeaderToken(const HTTPHeaderCode headerCode,
                                       char const* token,
                                       bool caseSensitive) const {
+  return doHeaderTokenCheck(headers_, headerCode, token, caseSensitive);
+}
+
+bool HTTPMessage::doHeaderTokenCheck(const HTTPHeaders& headers,
+                                     const HTTPHeaderCode headerCode,
+                                     char const* token,
+                                     bool caseSensitive) const {
   StringPiece tokenPiece(token);
   string lowerToken;
   if (!caseSensitive) {
@@ -740,10 +823,11 @@ bool HTTPMessage::checkForHeaderToken(const HTTPHeaderCode headerCode,
     boost::to_lower(lowerToken, defaultLocale);
     tokenPiece.reset(lowerToken);
   }
+
   // Search through all of the headers with this name.
   // forEachValueOfHeader will return true iff it was "broken" prematurely
   // with "return true" in the lambda-function
-  return headers_.forEachValueOfHeader(headerCode, [&] (const string& value) {
+  return headers.forEachValueOfHeader(headerCode, [&] (const string& value) {
     string lower;
     // Use StringPiece, since it implements a faster find() than std::string
     StringPiece headerValue;

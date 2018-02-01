@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -51,8 +51,8 @@ class SimpleController : public HTTPSessionController {
     HTTPTransaction* txn,
     const folly::SocketAddress& localAddress) override;
 
-  void attachSession(HTTPSession*) override;
-  void detachSession(const HTTPSession*) override;
+  void attachSession(HTTPSessionBase*) override;
+  void detachSession(const HTTPSessionBase*) override;
 
   std::chrono::milliseconds getGracefulShutdownTimeout() const override;
  protected:

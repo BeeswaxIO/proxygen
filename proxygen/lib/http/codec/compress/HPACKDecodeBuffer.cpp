@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -41,7 +41,7 @@ uint8_t HPACKDecodeBuffer::peek() {
   return *cursor_.data();
 }
 
-DecodeError HPACKDecodeBuffer::decodeLiteral(std::string& literal) {
+DecodeError HPACKDecodeBuffer::decodeLiteral(folly::fbstring& literal) {
   literal.clear();
   if (remainingBytes_ == 0) {
     LOG(ERROR) << "remainingBytes_ == 0";

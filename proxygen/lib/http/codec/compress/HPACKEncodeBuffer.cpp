@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -9,7 +9,6 @@
  */
 #include <proxygen/lib/http/codec/compress/HPACKEncodeBuffer.h>
 
-#include <ctype.h>
 #include <memory>
 #include <proxygen/lib/http/codec/compress/HPACKConstants.h>
 #include <proxygen/lib/http/codec/compress/Logging.h>
@@ -35,7 +34,7 @@ HPACKEncodeBuffer::HPACKEncodeBuffer(
 HPACKEncodeBuffer::HPACKEncodeBuffer(uint32_t growthSize) :
     growthSize_(growthSize),
     buf_(&bufQueue_, growthSize),
-    huffmanTree_(huffman::reqHuffTree05()),
+    huffmanTree_(huffman::huffTree()),
     huffmanEnabled_(false) {
 }
 
@@ -48,13 +47,18 @@ void HPACKEncodeBuffer::addHeadroom(uint32_t headroom) {
   bufQueue_.append(std::move(buf));
 }
 
+uint32_t HPACKEncodeBuffer::appendSequenceNumber(uint16_t seqn) {
+  buf_.writeBE<uint16_t>(seqn);
+  return sizeof(uint16_t);
+}
+
 void HPACKEncodeBuffer::append(uint8_t byte) {
   buf_.push(&byte, 1);
 }
 
 uint32_t HPACKEncodeBuffer::encodeInteger(uint32_t value, uint8_t prefix,
                                           uint8_t nbit) {
-  CHECK(nbit > 0 && nbit <= 8);
+  CHECK(nbit >= 0 && nbit <= 8);
   uint32_t count = 0;
   uint8_t prefix_mask = HPACK::NBIT_MASKS[nbit];
   uint8_t mask = ~prefix_mask & 0xFF;
@@ -85,7 +89,7 @@ uint32_t HPACKEncodeBuffer::encodeInteger(uint32_t value, uint8_t prefix,
   return count;
 }
 
-uint32_t HPACKEncodeBuffer::encodeHuffman(const std::string& literal) {
+uint32_t HPACKEncodeBuffer::encodeHuffman(const folly::fbstring& literal) {
   uint32_t size = huffmanTree_.getEncodeSize(literal);
   // add the length
   uint32_t count = encodeInteger(size, HPACK::LiteralEncoding::HUFFMAN, 7);
@@ -94,7 +98,7 @@ uint32_t HPACKEncodeBuffer::encodeHuffman(const std::string& literal) {
   return count;
 }
 
-uint32_t HPACKEncodeBuffer::encodeLiteral(const std::string& literal) {
+uint32_t HPACKEncodeBuffer::encodeLiteral(const folly::fbstring& literal) {
   if (huffmanEnabled_) {
     return encodeHuffman(literal);
   }

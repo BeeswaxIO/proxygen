@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -9,6 +9,7 @@
  */
 #pragma once
 
+#include <folly/FBString.h>
 #include <folly/io/Cursor.h>
 #include <folly/io/IOBufQueue.h>
 #include <proxygen/lib/http/codec/compress/HPACKConstants.h>
@@ -45,6 +46,8 @@ class HPACKEncodeBuffer {
    */
   void addHeadroom(uint32_t bytes);
 
+  uint32_t appendSequenceNumber(uint16_t seqn);
+
   /**
    * Encode the integer value using variable-length layout and the given prefix
    * that spans nbit bits.
@@ -67,12 +70,12 @@ class HPACKEncodeBuffer {
    *
    * @return bytes used for encoding
    */
-  uint32_t encodeLiteral(const std::string& literal);
+  uint32_t encodeLiteral(const folly::fbstring& literal);
 
   /**
    * encodes a string using huffman encoding
    */
-  uint32_t encodeHuffman(const std::string& literal);
+  uint32_t encodeHuffman(const folly::fbstring& literal);
 
   /**
    * prints the content of an IOBuf in binary format. Useful for debugging.

@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -10,6 +10,7 @@
 #pragma once
 
 #include <memory>
+#include <folly/FBString.h>
 #include <proxygen/lib/http/HTTPHeaderSize.h>
 #include <proxygen/lib/http/codec/compress/Header.h>
 #include <proxygen/lib/http/codec/compress/HeaderPiece.h>
@@ -34,6 +35,19 @@ enum class HeaderDecodeError : uint8_t {
   EMPTY_HEADER_NAME = 4,
   EMPTY_HEADER_VALUE = 5,
   INVALID_HEADER_VALUE = 6,
+  BAD_SEQUENCE_NUMBER = 7,
+
+  // HPACK specific error codes, starting in the 1xx range
+  INVALID_INDEX = 101,
+  INVALID_HUFFMAN_CODE = 102,
+  INVALID_ENCODING = 103,
+  INTEGER_OVERFLOW = 104,
+  INVALID_TABLE_SIZE = 105,
+  /* HEADERS_TOO_LARGE is 2 */
+  BUFFER_UNDERFLOW = 107,
+  LITERAL_TOO_LARGE = 108,
+  TIMEOUT = 109,
+  CANCELLED = 110
 };
 
 struct HeaderDecodeResult {
@@ -65,9 +79,9 @@ class HeaderCodec {
    public:
     virtual ~StreamingCallback() {}
 
-    virtual void onHeader(const std::string& name,
-                          const std::string& value) = 0;
-    virtual void onHeadersComplete() = 0;
+    virtual void onHeader(const folly::fbstring& name,
+                          const folly::fbstring& value) = 0;
+    virtual void onHeadersComplete(HTTPHeaderSize decodedSize) = 0;
     virtual void onDecodeError(HeaderDecodeError decodeError) = 0;
   };
 
@@ -120,7 +134,7 @@ class HeaderCodec {
     encodeHeadroom_ = headroom;
   }
 
-  void setMaxUncompressed(uint32_t maxUncompressed) {
+  virtual void setMaxUncompressed(uint32_t maxUncompressed) {
     maxUncompressed_ = maxUncompressed;
   }
 

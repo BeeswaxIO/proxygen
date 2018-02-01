@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -13,7 +13,6 @@
 #include <proxygen/lib/http/session/ByteEvents.h>
 #include <proxygen/lib/http/session/HTTPTransaction.h>
 #include <proxygen/lib/utils/Time.h>
-#include <folly/io/async/AsyncSocket.h>
 
 namespace proxygen {
 
@@ -51,25 +50,28 @@ class ByteEventTracker {
   virtual void addLastByteEvent(HTTPTransaction* txn,
                                 uint64_t byteNo,
                                 bool eorTrackingEnabled) noexcept;
+  virtual void addTrackedByteEvent(HTTPTransaction* txn,
+                                   uint64_t byteNo) noexcept;
 
   /**
    * Returns the number of bytes needed or 0 when there's nothing to do.
    */
   virtual uint64_t preSend(bool* cork, bool* eom, uint64_t bytesWritten);
 
-  virtual void addAckToLastByteEvent(HTTPTransaction* txn,
-                                     const ByteEvent& lastByteEvent,
-                                     bool eorTrackingEnabled) {}
+  virtual void addAckToLastByteEvent(
+      HTTPTransaction* /* txn */,
+      const ByteEvent& /* lastByteEvent */,
+      bool /* eorTrackingEnabled */) {}
 
   virtual void deleteAckEvent(
-    std::vector<AckByteEvent*>::iterator& it) noexcept {}
+    std::vector<AckByteEvent*>::iterator& /* it */) noexcept {}
 
   virtual bool setMaxTcpAckTracked(
-    uint32_t maxAckTracked,
-    AsyncTimeoutSet* ackLatencyTimeouts,
-    folly::AsyncTransportWrapper* transport) { return false; }
+    uint32_t /* maxAckTracked */,
+    AsyncTimeoutSet* /* ackLatencyTimeouts */,
+    folly::AsyncTransportWrapper* /* transport */) { return false; }
 
-  virtual void setTTLBAStats(TTLBAStats* stats) {}
+  virtual void setTTLBAStats(TTLBAStats* /* stats */) {}
 
   virtual void onAckLatencyEvent(const AckLatencyEvent&) {}
 
@@ -81,6 +83,16 @@ class ByteEventTracker {
   Callback* callback_;
 
   ByteEvent* nextLastByteEvent_{nullptr};
+};
+
+class ByteEventTrackerFactory {
+ public:
+  ByteEventTrackerFactory() = default;
+  virtual ~ByteEventTrackerFactory() = default;
+  virtual std::shared_ptr<ByteEventTracker> make(
+      ByteEventTracker::Callback* callback) {
+    return std::make_shared<ByteEventTracker>(callback);
+  }
 };
 
 } // proxygen

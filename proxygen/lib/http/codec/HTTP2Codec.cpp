@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -12,16 +12,29 @@
 #include <proxygen/lib/http/codec/SPDYUtil.h>
 #include <proxygen/lib/utils/ChromeUtils.h>
 #include <proxygen/lib/utils/Logging.h>
+#include <proxygen/lib/utils/Base64.h>
 
 #include <folly/Conv.h>
 #include <folly/io/Cursor.h>
 #include <folly/Random.h>
+#include <folly/tracing/ScopedTraceSection.h>
 
 using namespace proxygen::compress;
 using namespace folly::io;
 using namespace folly;
 
 using std::string;
+
+namespace {
+std::string base64url_encode(ByteRange range) {
+  return proxygen::Base64::urlEncode(range);
+}
+
+std::string base64url_decode(const std::string& str) {
+  return proxygen::Base64::urlDecode(str);
+}
+
+}
 
 namespace proxygen {
 
@@ -35,10 +48,18 @@ HTTP2Codec::HTTP2Codec(TransportDirection direction)
                       : FrameState::DOWNSTREAM_CONNECTION_PREFACE),
       decodeInfo_(HTTPRequestVerifier()) {
 
-  headerCodec_.setDecoderHeaderTableMaxSize(
-    egressSettings_.getSetting(SettingsId::HEADER_TABLE_SIZE, 0));
-  headerCodec_.setMaxUncompressed(
-    egressSettings_.getSetting(SettingsId::MAX_HEADER_LIST_SIZE, 0));
+  // Set headerCodec_ settings if specified, else let headerCodec_ utilize
+  // its own defaults
+  const auto decoderHeaderTableMaxSize = egressSettings_.getSetting(
+    SettingsId::HEADER_TABLE_SIZE);
+  if (decoderHeaderTableMaxSize) {
+    headerCodec_.setDecoderHeaderTableMaxSize(decoderHeaderTableMaxSize->value);
+  }
+  const auto maxHeaderListSize = egressSettings_.getSetting(
+    SettingsId::MAX_HEADER_LIST_SIZE);
+  if (maxHeaderListSize) {
+    headerCodec_.setMaxUncompressed(maxHeaderListSize->value);
+  }
 
   VLOG(4) << "creating " << getTransportDirectionString(direction)
           << " HTTP/2 codec";
@@ -50,6 +71,7 @@ HTTP2Codec::~HTTP2Codec() {}
 
 size_t HTTP2Codec::onIngress(const folly::IOBuf& buf) {
   // TODO: ensure only 1 parse at a time on stack.
+  FOLLY_SCOPED_TRACE_SECTION("HTTP2Codec - onIngress");
 
   Cursor cursor(&buf);
   size_t parsed = 0;
@@ -79,9 +101,9 @@ size_t HTTP2Codec::onIngress(const folly::IOBuf& buf) {
         if (frameState_ == FrameState::DOWNSTREAM_CONNECTION_PREFACE &&
             curHeader_.type != http2::FrameType::SETTINGS) {
           goawayErrorMessage_ = folly::to<string>(
-            "streamID=", curHeader_.stream,
-            " got invalid connection preface frame type=",
-            getFrameTypeString(curHeader_.type), "(", curHeader_.type, ")");
+              "GOAWAY error: got invalid connection preface frame type=",
+              getFrameTypeString(curHeader_.type), "(", curHeader_.type, ")",
+              " for streamID=", curHeader_.stream);
           VLOG(4) << goawayErrorMessage_;
           connError = ErrorCode::PROTOCOL_ERROR;
         }
@@ -89,6 +111,15 @@ size_t HTTP2Codec::onIngress(const folly::IOBuf& buf) {
           VLOG(4) << "Excessively large frame len=" << curHeader_.length;
           connError = ErrorCode::FRAME_SIZE_ERROR;
         }
+
+        if (callback_) {
+          callback_->onFrameHeader(
+            curHeader_.stream,
+            curHeader_.flags,
+            curHeader_.length,
+            static_cast<uint8_t>(curHeader_.type));
+        }
+
         frameState_ = (curHeader_.type == http2::FrameType::DATA) ?
           FrameState::DATA_FRAME_DATA : FrameState::FRAME_DATA;
         pendingDataFrameBytes_ = curHeader_.length;
@@ -132,21 +163,22 @@ size_t HTTP2Codec::onIngress(const folly::IOBuf& buf) {
 }
 
 ErrorCode HTTP2Codec::parseFrame(folly::io::Cursor& cursor) {
+  FOLLY_SCOPED_TRACE_SECTION("HTTP2Codec - parseFrame");
   if (expectedContinuationStream_ != 0 &&
        (curHeader_.type != http2::FrameType::CONTINUATION ||
         expectedContinuationStream_ != curHeader_.stream)) {
     goawayErrorMessage_ = folly::to<string>(
-      "streamID=", curHeader_.stream, " of type=",
-      getFrameTypeString(curHeader_.type),
-      " received while expected CONTINUATION with stream=",
-      expectedContinuationStream_);
+        "GOAWAY error: while expected CONTINUATION with stream=",
+        expectedContinuationStream_, ", received streamID=", curHeader_.stream,
+        " of type=", getFrameTypeString(curHeader_.type));
     VLOG(4) << goawayErrorMessage_;
     return ErrorCode::PROTOCOL_ERROR;
   }
   if (expectedContinuationStream_ == 0 &&
       curHeader_.type == http2::FrameType::CONTINUATION) {
     goawayErrorMessage_ = folly::to<string>(
-      "streamID=", curHeader_.stream, " received for unexpected CONTINUATION");
+        "GOAWAY error: unexpected CONTINUATION received with streamID=",
+        curHeader_.stream);
     VLOG(4) << goawayErrorMessage_;
     return ErrorCode::PROTOCOL_ERROR;
   }
@@ -171,12 +203,6 @@ ErrorCode HTTP2Codec::parseFrame(folly::io::Cursor& cursor) {
   expectedContinuationStream_ =
     (frameAffectsCompression(curHeader_.type) &&
      !(curHeader_.flags & http2::END_HEADERS)) ? curHeader_.stream : 0;
-
-  if (callback_) {
-    callback_->onFrameHeader(curHeader_.stream,
-                             curHeader_.flags,
-                             curHeader_.length);
-  }
 
   ErrorCode err = ErrorCode::NO_ERROR;
   switch (curHeader_.type) {
@@ -233,7 +259,7 @@ ErrorCode HTTP2Codec::parseAllData(Cursor& cursor) {
 
   if (callback_ && (padding > 0 || (outData && !outData->empty()))) {
     if (!outData) {
-      outData = folly::make_unique<IOBuf>();
+      outData = std::make_unique<IOBuf>();
     }
     deliverCallbackIfAllowed(&HTTPCodec::Callback::onBody, "onBody",
                              curHeader_.stream, std::move(outData), padding);
@@ -244,6 +270,7 @@ ErrorCode HTTP2Codec::parseAllData(Cursor& cursor) {
 ErrorCode HTTP2Codec::parseDataFrameData(Cursor& cursor,
                                          size_t bufLen,
                                          size_t& parsed) {
+  FOLLY_SCOPED_TRACE_SECTION("HTTP2Codec - parseDataFrameData");
   if (bufLen == 0) {
     VLOG(10) << "No data to parse";
     return ErrorCode::NO_ERROR;
@@ -310,7 +337,7 @@ ErrorCode HTTP2Codec::parseDataFrameData(Cursor& cursor,
 
   if (callback_ && (padding > 0 || (outData && !outData->empty()))) {
     if (!outData) {
-      outData = folly::make_unique<IOBuf>();
+      outData = std::make_unique<IOBuf>();
     }
     deliverCallbackIfAllowed(&HTTPCodec::Callback::onBody, "onBody",
                              curHeader_.stream, std::move(outData), padding);
@@ -320,6 +347,7 @@ ErrorCode HTTP2Codec::parseDataFrameData(Cursor& cursor,
 
 
 ErrorCode HTTP2Codec::parseHeaders(Cursor& cursor) {
+  FOLLY_SCOPED_TRACE_SECTION("HTTP2Codec - parseHeaders");
   boost::optional<http2::PriorityUpdate> priority;
   std::unique_ptr<IOBuf> headerBuf;
   VLOG(4) << "parsing HEADERS frame for stream=" << curHeader_.stream <<
@@ -345,10 +373,10 @@ ErrorCode HTTP2Codec::parseContinuation(Cursor& cursor) {
 }
 
 ErrorCode HTTP2Codec::parseHeadersImpl(
-  Cursor& cursor,
-  std::unique_ptr<IOBuf> headerBuf,
-  boost::optional<http2::PriorityUpdate> priority,
-  boost::optional<uint32_t> promisedStream) {
+    Cursor& /*cursor*/,
+    std::unique_ptr<IOBuf> headerBuf,
+    boost::optional<http2::PriorityUpdate> priority,
+    boost::optional<uint32_t> promisedStream) {
   curHeaderBlock_.append(std::move(headerBuf));
   std::unique_ptr<HTTPMessage> msg;
   if (curHeader_.flags & http2::END_HEADERS) {
@@ -356,7 +384,7 @@ ErrorCode HTTP2Codec::parseHeadersImpl(
     Cursor headerCursor(curHeaderBlock_.front());
     bool isRequest = (transportDirection_ == TransportDirection::DOWNSTREAM ||
                       promisedStream);
-    msg = folly::make_unique<HTTPMessage>();
+    msg = std::make_unique<HTTPMessage>();
     if (priority) {
       if (curHeader_.stream == priority->streamDependency) {
         streamError(folly::to<string>("Circular dependency for txn=",
@@ -375,22 +403,22 @@ ErrorCode HTTP2Codec::parseHeadersImpl(
                                  curHeaderBlock_.chainLength(),
                                  this);
     // Saving this in case we need to log it on error
-    folly::ScopeGuard g = folly::makeGuard([this] {
+    auto g = folly::makeGuard([this] {
         curHeaderBlock_.move();
       });
     // Check decoding error
     if (decodeInfo_.decodeError != HeaderDecodeError::NONE) {
       LOG(ERROR) << "Failed decoding header block for stream="
                  << curHeader_.stream << " header block=" << std::endl
-                 << IOBufPrinter::printHexFolly(curHeaderBlock_.front(), true);;
+                 << IOBufPrinter::printHexFolly(curHeaderBlock_.front(), true);
       return ErrorCode::COMPRESSION_ERROR;
     }
     // Check parsing error
     if (decodeInfo_.parsingError != "") {
       LOG(ERROR) << "Failed parsing header list for stream="
-                 << curHeader_.stream << " header block=" << std::endl
-                 << IOBufPrinter::printHexFolly(curHeaderBlock_.front(), true)
-                 << " error=" << decodeInfo_.parsingError;
+                 << curHeader_.stream << ", error=" << decodeInfo_.parsingError
+                 << ", header block="
+                 << IOBufPrinter::printHexFolly(curHeaderBlock_.front(), true);
       HTTPException err(HTTPException::Direction::INGRESS,
                         folly::to<std::string>("HTTP2Codec stream error: ",
                                                "stream=", curHeader_.stream,
@@ -454,8 +482,8 @@ ErrorCode HTTP2Codec::parseHeadersImpl(
   return ErrorCode::NO_ERROR;
 }
 
-void HTTP2Codec::onHeader(const std::string& name,
-                          const std::string& value) {
+void HTTP2Codec::onHeader(const folly::fbstring& name,
+                          const folly::fbstring& value) {
   // Refuse decoding other headers if an error is already found
   if (decodeInfo_.decodeError != HeaderDecodeError::NONE
       || decodeInfo_.parsingError != "") {
@@ -549,6 +577,8 @@ void HTTP2Codec::onHeader(const std::string& name,
     if (!nameOk || !valueOk) {
       decodeInfo_.parsingError = folly::to<string>("Bad header value: name=",
                                                    nameSp, " value=", valueSp);
+      VLOG(4) << "dir=" << uint32_t(transportDirection_) <<
+        decodeInfo_.parsingError << " codec=" << headerCodec_;
       return;
     }
     if (nameSp == "user-agent" &&
@@ -565,7 +595,7 @@ void HTTP2Codec::onHeader(const std::string& name,
   }
 }
 
-void HTTP2Codec::onHeadersComplete() {
+void HTTP2Codec::onHeadersComplete(HTTPHeaderSize decodedSize) {
   HTTPHeaders& headers = decodeInfo_.msg->getHeaders();
   HTTPRequestVerifier& verifier = decodeInfo_.verifier;
 
@@ -586,7 +616,7 @@ void HTTP2Codec::onHeadersComplete() {
   }
   decodeInfo_.msg->setAdvancedProtocolString(http2::kProtocolString);
   decodeInfo_.msg->setHTTPVersion(1, 1);
-  decodeInfo_.msg->setIngressHeaderSize(headerCodec_.getDecodedSize());
+  decodeInfo_.msg->setIngressHeaderSize(decodedSize);
 }
 
 void HTTP2Codec::onDecodeError(HeaderDecodeError decodeError) {
@@ -646,8 +676,8 @@ ErrorCode HTTP2Codec::parseRstStream(Cursor& cursor) {
   }
   if (statusCode == ErrorCode::PROTOCOL_ERROR) {
     goawayErrorMessage_ = folly::to<string>(
-      "streamID=", curHeader_.stream, " received as RST_STREAM with",
-      " code=", getErrorCodeString(statusCode), " user-agent=", userAgent_);
+        "GOAWAY error: RST_STREAM with code=", getErrorCodeString(statusCode),
+        " for streamID=", curHeader_.stream, " user-agent=", userAgent_);
     VLOG(2) << goawayErrorMessage_;
   }
   deliverCallbackIfAllowed(&HTTPCodec::Callback::onAbort, "onAbort",
@@ -661,7 +691,6 @@ ErrorCode HTTP2Codec::parseSettings(Cursor& cursor) {
   std::deque<SettingPair> settings;
   auto err = http2::parseSettings(cursor, curHeader_, settings);
   RETURN_IF_ERROR(err);
-  SettingsList settingsList;
   if (curHeader_.flags & http2::ACK) {
     // for stats
     if (callback_) {
@@ -669,21 +698,31 @@ ErrorCode HTTP2Codec::parseSettings(Cursor& cursor) {
     }
     return ErrorCode::NO_ERROR;
   }
+  return handleSettings(settings);
+}
+
+ErrorCode HTTP2Codec::handleSettings(const std::deque<SettingPair>& settings) {
+  SettingsList settingsList;
   for (auto& setting: settings) {
     switch (setting.first) {
       case SettingsId::HEADER_TABLE_SIZE:
-        // We could enforce an internal max rather than taking the max they
-        // give us.
-        VLOG(4) << "Setting header codec table size=" << setting.second;
-        headerCodec_.setEncoderHeaderTableSize(setting.second);
-        break;
+      {
+        uint32_t tableSize = setting.second;
+        if (setting.second > http2::kMaxHeaderTableSize) {
+          VLOG(2) << "Limiting table size from " << tableSize << " to " <<
+            http2::kMaxHeaderTableSize;
+          tableSize = http2::kMaxHeaderTableSize;
+        }
+        headerCodec_.setEncoderHeaderTableSize(tableSize);
+      }
+      break;
       case SettingsId::ENABLE_PUSH:
         if ((setting.second != 0 && setting.second != 1) ||
             (setting.second == 1 &&
              transportDirection_ == TransportDirection::UPSTREAM)) {
           goawayErrorMessage_ = folly::to<string>(
-            "streamID=", curHeader_.stream,
-            " with invalid ENABLE_PUSH setting=", setting.second);
+              "GOAWAY error: ENABLE_PUSH invalid setting=", setting.second,
+              " for streamID=", curHeader_.stream);
           VLOG(4) << goawayErrorMessage_;
           return ErrorCode::PROTOCOL_ERROR;
         }
@@ -693,9 +732,8 @@ ErrorCode HTTP2Codec::parseSettings(Cursor& cursor) {
       case SettingsId::INITIAL_WINDOW_SIZE:
         if (setting.second > http2::kMaxWindowUpdateSize) {
           goawayErrorMessage_ = folly::to<string>(
-            "streamID=", curHeader_.stream,
-            " with invalid INITIAL_WINDOW_SIZE size=",
-            setting.second);
+              "GOAWAY error: INITIAL_WINDOW_SIZE invalid size=", setting.second,
+              " for streamID=", curHeader_.stream);
           VLOG(4) << goawayErrorMessage_;
           return ErrorCode::PROTOCOL_ERROR;
         }
@@ -704,8 +742,8 @@ ErrorCode HTTP2Codec::parseSettings(Cursor& cursor) {
         if (setting.second < http2::kMaxFramePayloadLengthMin ||
             setting.second > http2::kMaxFramePayloadLength) {
           goawayErrorMessage_ = folly::to<string>(
-            "streamID=", curHeader_.stream,
-            " with invalid MAX_FRAME_SIZE size=", setting.second);
+              "GOAWAY error: MAX_FRAME_SIZE invalid size=", setting.second,
+              " for streamID=", curHeader_.stream);
           VLOG(4) << goawayErrorMessage_;
           return ErrorCode::PROTOCOL_ERROR;
         }
@@ -787,9 +825,9 @@ ErrorCode HTTP2Codec::parseGoaway(Cursor& cursor) {
   auto err = http2::parseGoaway(cursor, curHeader_, lastGoodStream, statusCode,
                                 debugData);
   if (statusCode != ErrorCode::NO_ERROR) {
-    VLOG(2) << "Goaway error lastStream=" << lastGoodStream <<
-      " statusCode=" << getErrorCodeString(statusCode) <<
-      " user-agent=" << userAgent_ <<  " debugData=" <<
+    VLOG(2) << "Goaway error statusCode=" << getErrorCodeString(statusCode)
+            << " lastStream=" << lastGoodStream
+            << " user-agent=" << userAgent_ <<  " debugData=" <<
       ((debugData) ? string((char*)debugData->data(), debugData->length()):
        empty_string);
   }
@@ -817,7 +855,8 @@ ErrorCode HTTP2Codec::parseWindowUpdate(Cursor& cursor) {
     VLOG(4) << "Invalid 0 length delta for stream=" << curHeader_.stream;
     if (curHeader_.stream == 0) {
       goawayErrorMessage_ = folly::to<string>(
-        "streamID=", curHeader_.stream, " with invalid 0 length delta");
+        "GOAWAY error: invalid/0 length delta for streamID=",
+        curHeader_.stream);
       return ErrorCode::PROTOCOL_ERROR;
     } else {
       // Parsing a zero delta window update should cause a protocol error
@@ -842,8 +881,8 @@ ErrorCode HTTP2Codec::parseWindowUpdate(Cursor& cursor) {
 ErrorCode HTTP2Codec::checkNewStream(uint32_t streamId) {
   if (streamId == 0 || streamId <= lastStreamID_) {
     goawayErrorMessage_ = folly::to<string>(
-      "streamID=", streamId, " received as invalid new stream, lastStreamID_=",
-      lastStreamID_);
+        "GOAWAY error: received streamID=", streamId,
+        " as invalid new stream for lastStreamID_=", lastStreamID_);
     VLOG(4) << goawayErrorMessage_;
     return ErrorCode::PROTOCOL_ERROR;
   }
@@ -853,8 +892,8 @@ ErrorCode HTTP2Codec::checkNewStream(uint32_t streamId) {
 
   if (isInitiatedStream(streamId)) {
     // this stream should be initiated by us, not by peer
-    goawayErrorMessage_ = folly::to<string>("streamID=", streamId,
-                                            " received as invalid new stream");
+    goawayErrorMessage_ = folly::to<string>(
+        "GOAWAY error: invalid new stream received with streamID=", streamId);
     VLOG(4) << goawayErrorMessage_;
     return ErrorCode::PROTOCOL_ERROR;
   } else {
@@ -869,6 +908,51 @@ size_t HTTP2Codec::generateConnectionPreface(folly::IOBufQueue& writeBuf) {
     return http2::kConnectionPreface.length();
   }
   return 0;
+}
+
+bool HTTP2Codec::onIngressUpgradeMessage(const HTTPMessage& msg) {
+  if (!HTTPParallelCodec::onIngressUpgradeMessage(msg)) {
+    return false;
+  }
+  if (msg.getHeaders().getNumberOfValues(http2::kProtocolSettingsHeader) != 1) {
+    VLOG(4) << __func__ << " with no HTTP2-Settings";
+    return false;
+  }
+
+  const auto& settingsHeader = msg.getHeaders().getSingleOrEmpty(
+    http2::kProtocolSettingsHeader);
+  if (settingsHeader.empty()) {
+    return true;
+  }
+
+  auto decoded = base64url_decode(settingsHeader);
+
+  // Must be well formed Base64Url and not too large
+  if (decoded.empty() || decoded.length() > http2::kMaxFramePayloadLength) {
+    VLOG(4) << __func__ << " failed to decode HTTP2-Settings";
+    return false;
+  }
+  std::unique_ptr<IOBuf> decodedBuf = IOBuf::wrapBuffer(decoded.data(),
+                                                        decoded.length());
+  IOBufQueue settingsQueue{IOBufQueue::cacheChainLength()};
+  settingsQueue.append(std::move(decodedBuf));
+  Cursor c(settingsQueue.front());
+  std::deque<SettingPair> settings;
+  // downcast is ok because of above length check
+  http2::FrameHeader frameHeader{
+    (uint32_t)settingsQueue.chainLength(), 0, http2::FrameType::SETTINGS, 0, 0};
+  auto err = http2::parseSettings(c, frameHeader, settings);
+  if (err != ErrorCode::NO_ERROR) {
+    VLOG(4) << __func__ << " bad settings frame";
+    return false;
+  }
+
+  if (handleSettings(settings) != ErrorCode::NO_ERROR) {
+    VLOG(4) << __func__ << " handleSettings failed";
+    return false;
+  }
+
+  return true;
 }
 
 void HTTP2Codec::generateHeader(folly::IOBufQueue& writeBuf,
@@ -899,22 +983,22 @@ void HTTP2Codec::generateHeader(folly::IOBufQueue& writeBuf,
     DCHECK(transportDirection_ == TransportDirection::UPSTREAM ||
            assocStream != 0);
     const string& method = msg.getMethodString();
-    allHeaders.emplace_back(http2::kMethod, method);
+    allHeaders.emplace_back(HTTP_HEADER_COLON_METHOD, method);
     if (msg.getMethod() != HTTPMethod::CONNECT) {
       const string& scheme = (msg.isSecure() ? http2::kHttps : http2::kHttp);
       const string& path = msg.getURL();
-      allHeaders.emplace_back(http2::kScheme, scheme);
-      allHeaders.emplace_back(http2::kPath, path);
+      allHeaders.emplace_back(HTTP_HEADER_COLON_SCHEME, scheme);
+      allHeaders.emplace_back(HTTP_HEADER_COLON_PATH, path);
     }
     const HTTPHeaders& headers = msg.getHeaders();
     const string& host = headers.getSingleOrEmpty(HTTP_HEADER_HOST);
     if (!host.empty()) {
-      allHeaders.emplace_back(http2::kAuthority, host);
+      allHeaders.emplace_back(HTTP_HEADER_COLON_AUTHORITY, host);
     }
   } else {
     DCHECK_EQ(transportDirection_, TransportDirection::DOWNSTREAM);
     status = folly::to<string>(msg.getStatusCode());
-    allHeaders.emplace_back(http2::kStatus, status);
+    allHeaders.emplace_back(HTTP_HEADER_COLON_STATUS, status);
     // HEADERS frames do not include a version or reason string.
   }
 
@@ -975,7 +1059,15 @@ void HTTP2Codec::generateHeader(folly::IOBufQueue& writeBuf,
                                   std::numeric_limits<uint32_t>::max())) {
     // The remote side told us they don't want headers this large...
     // but this function has no mechanism to fail
-    LOG(ERROR) << "generating HEADERS frame larger than peer maximum";
+    string serializedHeaders;
+    msg.getHeaders().forEach(
+      [&serializedHeaders] (const string& name, const string& value) {
+        serializedHeaders = folly::to<string>(serializedHeaders, "\\n", name,
+                                              ":", value);
+      });
+    LOG(ERROR) << "generating HEADERS frame larger than peer maximum nHeaders="
+               << msg.getHeaders().size() << " all headers="
+               << serializedHeaders;
   }
 
   IOBufQueue queue(IOBufQueue::cacheChainLength());
@@ -985,7 +1077,8 @@ void HTTP2Codec::generateHeader(folly::IOBufQueue& writeBuf,
     auto res = msg.getHTTP2Priority();
     size_t split = kHeaderSplitSize;
     if (res) {
-      pri = {std::get<0>(*res), std::get<1>(*res), std::get<2>(*res)};
+      pri = http2::PriorityUpdate{std::get<0>(*res), std::get<1>(*res),
+                                  std::get<2>(*res)};
       if (split > http2::kFramePrioritySize) {
         split -= http2::kFramePrioritySize;
       }
@@ -1043,29 +1136,29 @@ size_t HTTP2Codec::generateBody(folly::IOBufQueue& writeBuf,
   while (queue.chainLength() > maxSendFrameSize()) {
     auto chunk = queue.split(maxSendFrameSize());
     written += http2::writeData(writeBuf, std::move(chunk), stream,
-                                padding, false);
+                                padding, false, reuseIOBufHeadroomForData_);
   }
 
   return written + http2::writeData(writeBuf, queue.move(), stream,
-                                    padding, eom);
+                                    padding, eom, reuseIOBufHeadroomForData_);
 }
 
-size_t HTTP2Codec::generateChunkHeader(folly::IOBufQueue& writeBuf,
-                                       StreamID stream,
-                                       size_t length) {
+size_t HTTP2Codec::generateChunkHeader(folly::IOBufQueue& /*writeBuf*/,
+                                       StreamID /*stream*/,
+                                       size_t /*length*/) {
   // HTTP/2 has no chunk headers
   return 0;
 }
 
-size_t HTTP2Codec::generateChunkTerminator(folly::IOBufQueue& writeBuf,
-                                           StreamID stream) {
+size_t HTTP2Codec::generateChunkTerminator(folly::IOBufQueue& /*writeBuf*/,
+                                           StreamID /*stream*/) {
   // HTTP/2 has no chunk terminators
   return 0;
 }
 
-size_t HTTP2Codec::generateTrailers(folly::IOBufQueue& writeBuf,
-                                    StreamID stream,
-                                    const HTTPHeaders& trailers) {
+size_t HTTP2Codec::generateTrailers(folly::IOBufQueue& /*writeBuf*/,
+                                    StreamID /*stream*/,
+                                    const HTTPHeaders& /*trailers*/) {
   return 0;
 }
 
@@ -1073,11 +1166,12 @@ size_t HTTP2Codec::generateEOM(folly::IOBufQueue& writeBuf,
                                StreamID stream) {
   VLOG(4) << "sending EOM for stream=" << stream;
   if (!isStreamIngressEgressAllowed(stream)) {
-    VLOG(2) << "suppressed EOM stream=" << stream << " ingressGoawayAck_=" <<
-      ingressGoawayAck_;
+    VLOG(2) << "suppressed EOM for stream=" << stream << " ingressGoawayAck_="
+            << ingressGoawayAck_;
     return 0;
   }
-  return http2::writeData(writeBuf, nullptr, stream, http2::kNoPadding, true);
+  return http2::writeData(writeBuf, nullptr, stream, http2::kNoPadding, true,
+                          reuseIOBufHeadroomForData_);
 }
 
 size_t HTTP2Codec::generateRstStream(folly::IOBufQueue& writeBuf,
@@ -1086,8 +1180,8 @@ size_t HTTP2Codec::generateRstStream(folly::IOBufQueue& writeBuf,
   VLOG(4) << "sending RST_STREAM for stream=" << stream
           << " with code=" << getErrorCodeString(statusCode);
   if (!isStreamIngressEgressAllowed(stream)) {
-    VLOG(2) << "suppressed RST_STREAM stream=" << stream <<
-      " ingressGoawayAck_=" << ingressGoawayAck_;
+    VLOG(2) << "suppressed RST_STREAM for stream=" << stream
+            << " ingressGoawayAck_=" << ingressGoawayAck_;
     return 0;
   }
   // Suppress any EOM callback for the current frame.
@@ -1097,9 +1191,8 @@ size_t HTTP2Codec::generateRstStream(folly::IOBufQueue& writeBuf,
   }
 
   if (statusCode == ErrorCode::PROTOCOL_ERROR) {
-    VLOG(2) << "sending RST_STREAM for stream=" << stream
-            << " with code=" << getErrorCodeString(statusCode)
-            << " user-agent=" << userAgent_;
+    VLOG(2) << "sending RST_STREAM with code=" << getErrorCodeString(statusCode)
+            << " for stream=" << stream << " user-agent=" << userAgent_;
   }
   auto code = http2::errorCodeToReset(statusCode);
   return http2::writeRstStream(writeBuf, stream, code);
@@ -1164,25 +1257,45 @@ size_t HTTP2Codec::generatePingReply(folly::IOBufQueue& writeBuf,
 size_t HTTP2Codec::generateSettings(folly::IOBufQueue& writeBuf) {
   std::deque<SettingPair> settings;
   for (auto& setting: egressSettings_.getAllSettings()) {
-    if (setting.isSet) {
-      if (setting.id == SettingsId::HEADER_TABLE_SIZE) {
-        headerCodec_.setDecoderHeaderTableMaxSize(setting.value);
-      } else if (setting.id == SettingsId::MAX_HEADER_LIST_SIZE) {
-        headerCodec_.setMaxUncompressed(setting.value);
-      } else if (setting.id == SettingsId::ENABLE_PUSH) {
-        if (transportDirection_ == TransportDirection::DOWNSTREAM) {
-          // HTTP/2 spec says downstream must not send this flag
-          // HTTP2Codec uses it to determine if push features are enabled
-          continue;
-        } else {
-          CHECK(setting.value == 0 || setting.value == 1);
-        }
+    if (setting.id == SettingsId::HEADER_TABLE_SIZE) {
+      headerCodec_.setDecoderHeaderTableMaxSize(setting.value);
+    } else if (setting.id == SettingsId::MAX_HEADER_LIST_SIZE) {
+      headerCodec_.setMaxUncompressed(setting.value);
+    } else if (setting.id == SettingsId::ENABLE_PUSH) {
+      if (transportDirection_ == TransportDirection::DOWNSTREAM) {
+        // HTTP/2 spec says downstream must not send this flag
+        // HTTP2Codec uses it to determine if push features are enabled
+        continue;
+      } else {
+        CHECK(setting.value == 0 || setting.value == 1);
       }
-      settings.push_back(SettingPair(setting.id, setting.value));
     }
+    settings.push_back(SettingPair(setting.id, setting.value));
   }
   VLOG(4) << "generating " << (unsigned)settings.size() << " settings";
   return http2::writeSettings(writeBuf, settings);
+}
+
+void HTTP2Codec::requestUpgrade(HTTPMessage& request) {
+  static HTTP2Codec defaultCodec(TransportDirection::UPSTREAM);
+
+  auto& headers = request.getHeaders();
+  headers.set(HTTP_HEADER_UPGRADE, http2::kProtocolCleartextString);
+  if (!request.checkForHeaderToken(HTTP_HEADER_CONNECTION, "Upgrade", false)) {
+    headers.add(HTTP_HEADER_CONNECTION, "Upgrade");
+  }
+  IOBufQueue writeBuf{IOBufQueue::cacheChainLength()};
+  defaultCodec.generateSettings(writeBuf);
+  writeBuf.trimStart(http2::kFrameHeaderSize);
+  auto buf = writeBuf.move();
+  buf->coalesce();
+  headers.set(http2::kProtocolSettingsHeader,
+              base64url_encode(folly::ByteRange(buf->data(), buf->length())));
+  if (!request.checkForHeaderToken(HTTP_HEADER_CONNECTION,
+                                   http2::kProtocolSettingsHeader.c_str(),
+                                   false)) {
+    headers.add(HTTP_HEADER_CONNECTION, http2::kProtocolSettingsHeader);
+  }
 }
 
 size_t HTTP2Codec::generateSettingsAck(folly::IOBufQueue& writeBuf) {
@@ -1196,8 +1309,8 @@ size_t HTTP2Codec::generateWindowUpdate(folly::IOBufQueue& writeBuf,
   VLOG(4) << "generating window update for stream=" << stream
           << ": Processed " << delta << " bytes";
   if (!isStreamIngressEgressAllowed(stream)) {
-    VLOG(2) << "suppressed WINDOW_UPDATE stream=" << stream <<
-      " ingressGoawayAck_=" << ingressGoawayAck_;
+    VLOG(2) << "suppressed WINDOW_UPDATE for stream=" << stream
+            << " ingressGoawayAck_=" << ingressGoawayAck_;
     return 0;
   }
   return http2::writeWindowUpdate(writeBuf, stream, delta);
@@ -1208,8 +1321,8 @@ size_t HTTP2Codec::generatePriority(folly::IOBufQueue& writeBuf,
                                     const HTTPMessage::HTTPPriority& pri) {
   VLOG(4) << "generating priority for stream=" << stream;
   if (!isStreamIngressEgressAllowed(stream)) {
-    VLOG(2) << "suppressed PRIORITY stream=" << stream <<
-      " ingressGoawayAck_=" << ingressGoawayAck_;
+    VLOG(2) << "suppressed PRIORITY for stream=" << stream
+            << " ingressGoawayAck_=" << ingressGoawayAck_;
     return 0;
   }
   return http2::writePriority(writeBuf, stream,

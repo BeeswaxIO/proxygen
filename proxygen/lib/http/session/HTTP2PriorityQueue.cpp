@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -14,6 +14,7 @@ using std::unique_ptr;
 
 namespace proxygen {
 
+uint32_t HTTP2PriorityQueue::kMaxRebuilds_ = 3;
 std::chrono::milliseconds HTTP2PriorityQueue::kNodeLifetime_ =
   std::chrono::seconds(30);
 
@@ -221,7 +222,7 @@ HTTP2PriorityQueue::Node::updateWeight(uint8_t weight) {
   int16_t delta = weight - weight_ + 1;
   weight_ = weight + 1;
   parent_->totalChildWeight_ += delta;
-  if (isEnqueued()) {
+  if (inEgressTree()) {
     parent_->totalEnqueuedWeight_ += delta;
   }
   refreshTimeout();
@@ -329,8 +330,7 @@ HTTP2PriorityQueue::Node::updateEnqueuedWeight(bool activeNodes) {
   if (activeNodes) {
     if (totalEnqueuedWeightCheck_ == 0 && !isEnqueued()) {
       // Must only be called with activeCount_ > 0, root cannot be dequeued
-      CHECK_NOTNULL(parent_);
-      parent_->totalEnqueuedWeightCheck_ -= weight_;
+      CHECK_NOTNULL(parent_)->totalEnqueuedWeightCheck_ -= weight_;
     } else {
       CHECK(parent_ == nullptr || enqueuedHook_.is_linked());
     }
@@ -362,14 +362,71 @@ HTTP2PriorityQueue::Node::convertVirtualNode(HTTPTransaction* txn) {
 }
 
 uint64_t
-HTTP2PriorityQueue::Node::calculateDepth() const {
+HTTP2PriorityQueue::Node::calculateDepth(bool includeVirtual) const {
   uint64_t depth = 0;
   const Node* cur = this;
   while (cur->getParent() != nullptr) {
-    depth += 1;
+    if (cur->txn_ || includeVirtual) {
+      depth += 1;
+    }
     cur = cur->getParent();
   }
   return depth;
+}
+
+void
+HTTP2PriorityQueue::Node::flattenSubtree() {
+  std::list<std::unique_ptr<Node>> oldChildren_;
+  // Move the old children to a temporary list
+  std::swap(oldChildren_, children_);
+  // Reparent the children
+  for (auto& child : oldChildren_) {
+    child->flattenSubtreeDFS(this);
+    addChildToNewSubtreeRoot(std::move(child), this);
+  }
+  // Update the weights
+  totalEnqueuedWeight_ = 0;
+#ifndef NDEBUG
+  totalEnqueuedWeightCheck_ = 0;
+#endif
+  totalChildWeight_ = 0;
+  std::for_each(
+    children_.begin(),
+    children_.end(),
+    [this](const std::unique_ptr<Node>& child) {
+      totalChildWeight_ += child->weight_;
+      if (child->enqueued_) {
+        totalEnqueuedWeight_ += child->weight_;
+#ifndef NDEBUG
+        totalEnqueuedWeightCheck_ += child->weight_;
+#endif
+      }
+    }
+  );
+}
+
+void
+HTTP2PriorityQueue::Node::flattenSubtreeDFS(Node* subtreeRoot) {
+  for (auto& child : children_) {
+    child->flattenSubtreeDFS(subtreeRoot);
+    addChildToNewSubtreeRoot(std::move(child), subtreeRoot);
+  }
+}
+
+void
+HTTP2PriorityQueue::Node::addChildToNewSubtreeRoot(std::unique_ptr<Node> child,
+                                                   Node* subtreeRoot) {
+  child->children_.clear();
+  child->parent_ = subtreeRoot;
+  child->weight_ = 16;
+  child->totalChildWeight_ = 0;
+  child->totalEnqueuedWeight_ = 0;
+#ifndef NDEBUG
+  child->totalEnqueuedWeightCheck_ = 0;
+#endif
+  Node* raw = child.get();
+  raw->self_ = subtreeRoot->children_.insert(subtreeRoot->children_.end(),
+                                             std::move(child));
 }
 
 /// class HTTP2PriorityQueue
@@ -406,11 +463,10 @@ HTTP2PriorityQueue::addTransaction(HTTPCodec::StreamID id,
   CHECK_NE(id, 0);
   CHECK_NE(id, pri.streamDependency) << "Tried to create a loop in the tree";
   CHECK(!txn || !permanent);
-  Node *existingNode = find(id);
+  Node *existingNode = find(id, depth);
   if (existingNode) {
-    CHECK(txn);
     CHECK(!permanent);
-    existingNode->convertVirtualNode(txn);
+    existingNode->convertVirtualNode(CHECK_NOTNULL(txn));
     updatePriority(existingNode, pri);
     return existingNode;
   }
@@ -423,7 +479,7 @@ HTTP2PriorityQueue::addTransaction(HTTPCodec::StreamID id,
 
   Node* parent = &root_;
   if (depth) {
-    *depth = 0;
+    *depth = 1;
   }
   if (pri.streamDependency != 0) {
     Node* dep = find(pri.streamDependency, depth);
@@ -439,7 +495,7 @@ HTTP2PriorityQueue::addTransaction(HTTPCodec::StreamID id,
   }
   VLOG(4) << "Adding id=" << id << " with parent=" << parent->getID() <<
     " and weight=" << ((uint16_t)pri.weight + 1);
-  auto node = folly::make_unique<Node>(*this, parent, id, pri.weight, txn);
+  auto node = std::make_unique<Node>(*this, parent, id, pri.weight, txn);
   if (permanent) {
     node->setPermanent();
   } else if (!txn) {
@@ -460,7 +516,7 @@ HTTP2PriorityQueue::updatePriority(HTTP2PriorityQueue::Handle handle,
     pri.streamDependency << " and weight=" << ((uint16_t)pri.weight + 1);
   node->updateWeight(pri.weight);
   CHECK_NE(pri.streamDependency, node->getID()) <<
-    "Tried to create a loop in the tree";;
+    "Tried to create a loop in the tree";
   if (pri.streamDependency == node->parentID() && !pri.exclusive) {
     // no move
     if (depth) {
@@ -624,6 +680,15 @@ HTTP2PriorityQueue::updateEnqueuedWeight() {
     pendingWeightChange_ = false;
   }
 #endif
+}
+
+// Internal error handling
+
+void
+HTTP2PriorityQueue::rebuildTree() {
+  CHECK_LE(rebuildCount_ + 1, kMaxRebuilds_);
+  root_.flattenSubtree();
+  rebuildCount_++;
 }
 
 }

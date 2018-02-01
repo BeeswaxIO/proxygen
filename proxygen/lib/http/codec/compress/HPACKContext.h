@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -17,8 +17,7 @@ namespace proxygen {
 
 class HPACKContext {
  public:
-  HPACKContext(HPACK::MessageType msgType,
-               uint32_t tableSize);
+  HPACKContext(uint32_t tableSize, bool qcram, bool useBaseIndex);
   virtual ~HPACKContext() {}
 
   /**
@@ -27,14 +26,16 @@ class HPACKContext {
    *
    * @return 0 if cannot be found
    */
-  virtual uint32_t getIndex(const HPACKHeader& header) const;
+  virtual uint32_t getIndex(const HPACKHeader& header,
+                            int32_t commitEpoch, int32_t curEpoch) const;
 
   /**
    * index of a header entry with the given name from dynamic or static table
    *
    * @return 0 if name not found
    */
-  virtual uint32_t nameIndex(const std::string& name) const;
+  virtual uint32_t nameIndex(const HPACKHeaderName& headerName,
+                             int32_t commitEpoch, int32_t curEpoch) const;
 
   /**
    * @return true if the given index points to a static header entry
@@ -50,8 +51,12 @@ class HPACKContext {
     return table_;
   }
 
+  void seedHeaderTable(std::vector<HPACKHeader>& headers);
+
+  void describe(std::ostream& os) const;
+
  protected:
-  virtual const HeaderTable& getStaticTable() const {
+  virtual const StaticHeaderTable& getStaticTable() const {
     return StaticHeaderTable::get();
   }
 
@@ -60,20 +65,22 @@ class HPACKContext {
   const HPACKHeader& getDynamicHeader(uint32_t index);
 
   virtual uint32_t globalToDynamicIndex(uint32_t index) const {
-    return index;
+    return index - getStaticTable().size();
   }
   virtual uint32_t globalToStaticIndex(uint32_t index) const {
-    return index - table_.size();
-  }
-  virtual uint32_t dynamicToGlobalIndex(uint32_t index) const {
     return index;
   }
+  virtual uint32_t dynamicToGlobalIndex(uint32_t index) const {
+    return index + getStaticTable().size();
+  }
   virtual uint32_t staticToGlobalIndex(uint32_t index) const {
-    return index + table_.size();
+    return index;
   }
 
   HeaderTable table_;
-  HPACK::MessageType msgType_;
+  bool useBaseIndex_{false};
 };
+
+std::ostream& operator<<(std::ostream& os, const HPACKContext& context);
 
 }

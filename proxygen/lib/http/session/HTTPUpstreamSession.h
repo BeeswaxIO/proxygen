@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -18,7 +18,6 @@ namespace proxygen {
 
 class HTTPSessionStats;
 class SPDYStats;
-class HTTPUpstreamSessionController;
 
 class HTTPUpstreamSession final: public HTTPSession {
  public:
@@ -40,7 +39,9 @@ class HTTPUpstreamSession final: public HTTPSession {
       std::unique_ptr<HTTPCodec> codec,
       const wangle::TransportInfo& tinfo,
       InfoCallback* infoCallback,
-      uint8_t maxVirtualPri = 0):
+      uint8_t maxVirtualPri = 0,
+      std::shared_ptr<const PriorityMapFactory> priorityMapFactory =
+          std::shared_ptr<const PriorityMapFactory>()) :
     HTTPSession(
         timeout,
         std::move(sock),
@@ -50,7 +51,8 @@ class HTTPUpstreamSession final: public HTTPSession {
         std::move(codec),
         tinfo,
         infoCallback),
-    maxVirtualPriorityLevel_(maxVirtualPri) {
+    maxVirtualPriorityLevel_(priorityMapFactory ? 0 : maxVirtualPri),
+    priorityMapFactory_(priorityMapFactory) {
     if (sock_) {
       auto asyncSocket = sock_->getUnderlyingTransport<folly::AsyncSocket>();
       if (asyncSocket) {
@@ -69,21 +71,36 @@ class HTTPUpstreamSession final: public HTTPSession {
       std::unique_ptr<HTTPCodec> codec,
       const wangle::TransportInfo& tinfo,
       InfoCallback* infoCallback,
-      uint8_t maxVirtualPri = 0):
-    HTTPUpstreamSession(WheelTimerInstance(timeout), std::move(sock), localAddr,
-        peerAddr, std::move(codec), tinfo, infoCallback, maxVirtualPri) {
+      uint8_t maxVirtualPri = 0,
+      std::shared_ptr<const PriorityMapFactory> priorityMapFactory =
+          std::shared_ptr<const PriorityMapFactory>()) :
+    HTTPUpstreamSession(
+        WheelTimerInstance(timeout),
+        std::move(sock),
+        localAddr,
+        peerAddr,
+        std::move(codec),
+        tinfo,
+        infoCallback,
+        maxVirtualPri,
+        priorityMapFactory) {
   }
 
   using FilterIteratorFn = std::function<void(HTTPCodecFilter*)>;
+
+  void detachTransactions();
+
+  bool isDetachable(bool checkSocket=true) const override;
+
   void attachThreadLocals(folly::EventBase* eventBase,
                           folly::SSLContextPtr sslContext,
                           const WheelTimerInstance& timeout,
                           HTTPSessionStats* stats,
                           FilterIteratorFn fn,
                           HeaderCodec::Stats* headerCodecStats,
-                          HTTPUpstreamSessionController* controller);
+                          HTTPSessionController* controller) override;
 
-  void detachThreadLocals();
+  void detachThreadLocals(bool detachSSLContext=false) override;
 
   void startNow() override;
 
@@ -94,27 +111,35 @@ class HTTPUpstreamSession final: public HTTPSession {
    * @param handler The request handler to attach to this transaction. It must
    *                not be null.
    */
-  HTTPTransaction* newTransaction(HTTPTransaction::Handler* handler);
+  HTTPTransaction* newTransaction(HTTPTransaction::Handler* handler) override;
 
   /**
    * Returns true if this session has no open transactions and the underlying
    * transport can be used again in a new request.
    */
-  bool isReusable() const;
+  bool isReusable() const override;
 
   /**
    * Returns true if the session is shutting down
    */
-  bool isClosing() const;
+  bool isClosing() const override;
 
   /**
    * Drains the current transactions and prevents new transactions from being
    * created on this session. When the number of transactions reaches zero, this
    * session will shutdown the transport and delete itself.
    */
-  void drain() {
+  void drain() override {
     HTTPSession::drain();
   }
+
+ virtual folly::Optional<const HTTPMessage::HTTPPriority> getHTTPPriority(
+     uint8_t level) override {
+   if (!priorityAdapter_) {
+     return HTTPSession::getHTTPPriority(level);
+   }
+   return priorityAdapter_->getHTTPPriority(level);
+ }
 
  private:
   ~HTTPUpstreamSession() override;
@@ -122,14 +147,8 @@ class HTTPUpstreamSession final: public HTTPSession {
   /**
    * Called by onHeadersComplete(). Currently a no-op for upstream.
    */
-  void setupOnHeadersComplete(HTTPTransaction* txn,
-                              HTTPMessage* msg) override {}
-
-  /**
-   * Called by processParseError() if the transaction has no handler.
-   */
-  HTTPTransaction::Handler* getParseErrorHandler(
-    HTTPTransaction* txn, const HTTPException& error) override;
+  void setupOnHeadersComplete(
+      HTTPTransaction* /* txn */, HTTPMessage* /* msg */) override {}
 
   /**
    * Called by transactionTimeout() if the transaction has no handler.
@@ -146,6 +165,8 @@ class HTTPUpstreamSession final: public HTTPSession {
 
   uint8_t maxVirtualPriorityLevel_{0};
 
+  std::shared_ptr<const PriorityMapFactory> priorityMapFactory_;
+  std::unique_ptr<PriorityAdapter> priorityAdapter_;
 };
 
 } // proxygen

@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -128,8 +128,8 @@ TestAsyncTransport::WriteEvent::~WriteEvent() {
 shared_ptr<TestAsyncTransport::WriteEvent>
 TestAsyncTransport::WriteEvent::newEvent(const struct iovec* vec,
                                          size_t count) {
-  size_t len = sizeof(WriteEvent) + (count * sizeof(struct iovec));
-  void* buf = malloc(len);
+  size_t bufLen = sizeof(WriteEvent) + (count * sizeof(struct iovec));
+  void* buf = malloc(bufLen);
   if (buf == nullptr) {
     throw std::bad_alloc();
   }

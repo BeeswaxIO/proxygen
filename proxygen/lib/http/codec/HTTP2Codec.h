@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -16,9 +16,10 @@
 #include <proxygen/lib/http/codec/HTTPSettings.h>
 #include <proxygen/lib/utils/Result.h>
 
-#include <proxygen/lib/http/codec/compress/experimental/hpack9/HPACKCodec.h>
+#include <proxygen/lib/http/codec/compress/HPACKCodec.h>
 
 #include <bitset>
+#include <set>
 
 namespace proxygen {
 
@@ -28,9 +29,9 @@ namespace proxygen {
  */
 class HTTP2Codec: public HTTPParallelCodec, HeaderCodec::StreamingCallback {
 public:
-  void onHeader(const std::string& name,
-                const std::string& value) override;
-  void onHeadersComplete() override;
+  void onHeader(const folly::fbstring& name,
+                const folly::fbstring& value) override;
+  void onHeadersComplete(HTTPHeaderSize decodedSize) override;
   void onDecodeError(HeaderDecodeError decodeError) override;
 
   explicit HTTP2Codec(TransportDirection direction);
@@ -41,7 +42,12 @@ public:
     return CodecProtocol::HTTP_2;
   }
 
+  const std::string& getUserAgent() const override {
+    return userAgent_;
+  }
+
   size_t onIngress(const folly::IOBuf& buf) override;
+  bool onIngressUpgradeMessage(const HTTPMessage& msg) override;
   size_t generateConnectionPreface(folly::IOBufQueue& writeBuf) override;
   void generateHeader(folly::IOBufQueue& writeBuf,
                       StreamID stream,
@@ -107,7 +113,13 @@ public:
       uint8_t maxLevel) override;
   HTTPCodec::StreamID mapPriorityToDependency(uint8_t priority) const override;
 
+  HPACKTableInfo getHPACKTableInfo() const override {
+    return headerCodec_.getHPACKTableInfo();
+  }
+
   //HTTP2Codec specific API
+
+  static void requestUpgrade(HTTPMessage& request);
 
 #ifndef NDEBUG
   uint64_t getReceivedFrameCount() const {
@@ -117,6 +129,19 @@ public:
 
   static void setHeaderSplitSize(uint32_t splitSize) {
     kHeaderSplitSize = splitSize;
+  }
+
+  // Whether turn on the optimization to reuse IOBuf headroom when write DATA
+  // frame. For other frames, it's always ON.
+  void setReuseIOBufHeadroomForData(bool enabled) {
+    reuseIOBufHeadroomForData_ = enabled;
+  }
+
+  void setHeaderIndexingStrategy(const HeaderIndexingStrategy* indexingStrat) {
+    headerCodec_.setHeaderIndexingStrategy(indexingStrat);
+  }
+  const HeaderIndexingStrategy* getHeaderIndexingStrategy() const {
+    return headerCodec_.getHeaderIndexingStrategy();
   }
 
  private:
@@ -178,6 +203,7 @@ public:
   ErrorCode handleEndStream();
   ErrorCode checkNewStream(uint32_t stream);
   bool checkConnectionError(ErrorCode, const folly::IOBuf* buf);
+  ErrorCode handleSettings(const std::deque<SettingPair>& settings);
   uint32_t maxSendFrameSize() const {
     return ingressSettings_.getSetting(SettingsId::MAX_FRAME_SIZE,
                                        http2::kMaxFramePayloadLengthMin);
@@ -188,7 +214,7 @@ public:
   }
   void streamError(const std::string& msg, ErrorCode error, bool newTxn=false);
 
-  HPACKCodec09 headerCodec_;
+  HPACKCodec headerCodec_;
 
   // Current frame state
   http2::FrameHeader curHeader_;
@@ -228,6 +254,7 @@ public:
   static uint32_t kHeaderSplitSize;
   HeaderDecodeInfo decodeInfo_;
   std::vector<StreamID> virtualPriorityNodes_;
+  bool reuseIOBufHeadroomForData_{true};
 };
 
 } // proxygen

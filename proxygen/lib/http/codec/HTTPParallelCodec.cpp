@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -12,15 +12,11 @@
 #include <algorithm>
 #include <boost/algorithm/string.hpp>
 #include <folly/Conv.h>
-#include <folly/Memory.h>
-#include <folly/ScopeGuard.h>
 #include <folly/String.h>
 #include <folly/io/Cursor.h>
 #include <glog/logging.h>
-#include <iostream>
 #include <proxygen/lib/http/HTTPHeaderSize.h>
 #include <proxygen/lib/http/HTTPMessage.h>
-#include <proxygen/lib/http/codec/CodecDictionaries.h>
 
 namespace proxygen {
 
@@ -64,7 +60,7 @@ void HTTPParallelCodec::enableDoubleGoawayDrain() {
   sessionClosing_ = ClosingState::OPEN_WITH_GRACEFUL_DRAIN_ENABLED;
 }
 
-bool HTTPParallelCodec::onIngressUpgradeMessage(const HTTPMessage& msg) {
+bool HTTPParallelCodec::onIngressUpgradeMessage(const HTTPMessage& /*msg*/) {
   if (transportDirection_ == TransportDirection::DOWNSTREAM) {
     lastStreamID_ = 1;
   }

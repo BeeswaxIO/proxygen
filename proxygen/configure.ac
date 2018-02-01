@@ -35,6 +35,7 @@ CXXFLAGS="-fno-strict-aliasing $CXXFLAGS"
 CXXFLAGS="-O3 -g -W -Wall -Wextra -Wno-unused-parameter $CXXFLAGS"
 CXXFLAGS=" -Wno-missing-field-initializers -Wno-deprecated $CXXFLAGS"
 CXXFLAGS="-DLIBMC_FBTRACE_DISABLE $CXXFLAGS"
+CXXFLAGS="-pthread $CXXFLAGS"
 
 CFLAGS="-DLIBMC_FBTRACE_DISABLE $CFLAGS"
 
@@ -53,9 +54,8 @@ AC_HEADER_STDC
 AC_CHECK_HEADERS([arpa/inet.h fcntl.h limits.h netdb.h stdint.h string.h sys/file.h sys/time.h syslog.h unistd.h malloc.h])
 
 AC_CHECK_LIB([event], [event_set], [], [AC_MSG_ERROR([Unable to find libevent])])
-AC_CHECK_LIB([cap], [cap_get_proc], [], [AC_MSG_ERROR([Unable to find libcap])])
 AC_CHECK_LIB([crypto], [MD5_Init], [], [AC_MSG_ERROR([Unable to find libcrypto])])
-AC_CHECK_LIB([ssl], [SSL_library_init], [], [AC_MSG_ERROR([Unable to find libssl])])
+AC_CHECK_LIB([ssl], [SSL_SESSION_new], [], [AC_MSG_ERROR([Unable to find libssl])])
 AC_CHECK_LIB([z], [gzread], [], [AC_MSG_ERROR([Unable to find zlib])])
 AC_CHECK_LIB([folly],[getenv],[],[AC_MSG_ERROR(
              [Please install the folly library from https://github.com/facebook/folly])])
@@ -236,9 +236,12 @@ AC_CONFIG_FILES([Makefile
                  httpserver/Makefile
                  httpserver/samples/Makefile
                  httpserver/samples/echo/Makefile
+                 httpserver/samples/proxy/Makefile
+                 httpserver/samples/push/Makefile
                  httpserver/tests/Makefile
                  httpclient/Makefile
                  httpclient/samples/curl/Makefile
-                 httpclient/samples/Makefile])
+                 httpclient/samples/Makefile
+                 external/Makefile])
 
 AC_OUTPUT

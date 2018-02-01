@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -9,8 +9,9 @@
  */
 #pragma once
 
-#include <glog/logging.h>
 #include <chrono>
+#include <glog/logging.h>
+#include <proxygen/lib/http/codec/compress/HeaderIndexingStrategy.h>
 
 namespace folly {
 class SocketAddress;
@@ -20,7 +21,7 @@ namespace proxygen {
 
 class HTTPException;
 class HTTPMessage;
-class HTTPSession;
+class HTTPSessionBase;
 class HTTPTransaction;
 class HTTPTransactionHandler;
 
@@ -63,27 +64,44 @@ class HTTPSessionController {
   /**
    * Inform the controller it is associated with this particular session.
    */
-  virtual void attachSession(HTTPSession* session) = 0;
+  virtual void attachSession(HTTPSessionBase* session) = 0;
 
   /**
    * Informed at the end when the given HTTPSession is going away.
    */
-  virtual void detachSession(const HTTPSession* session) = 0;
+  virtual void detachSession(const HTTPSessionBase* session) = 0;
 
   /**
    * Inform the controller that the session's codec changed
    */
-  virtual void onSessionCodecChange(HTTPSession* session) {}
+  virtual void onSessionCodecChange(HTTPSessionBase* /*session*/) {}
 
+  /**
+   * Optionally allow the session to query custom graceful shutdown timeout.
+   */
   virtual std::chrono::milliseconds getGracefulShutdownTimeout() const {
     return std::chrono::milliseconds(0);
+  }
+
+  /**
+   * Optionally allow the session to query custom flow control timeout.
+   */
+  virtual std::chrono::milliseconds getSessionFlowControlTimeout() const {
+    return std::chrono::milliseconds(0);
+  }
+
+  /**
+   * Returns the H2 header indexing strategy to be employed by the session
+   */
+  virtual const HeaderIndexingStrategy* getHeaderIndexingStrategy() const {
+    return HeaderIndexingStrategy::getDefaultInstance();
   }
 };
 
 
 class HTTPUpstreamSessionController : public HTTPSessionController {
-  HTTPTransactionHandler* getRequestHandler(
-    HTTPTransaction& txn, HTTPMessage* msg) override final {
+  HTTPTransactionHandler* getRequestHandler(HTTPTransaction& /*txn*/,
+                                            HTTPMessage* /*msg*/) final {
     LOG(FATAL) << "Unreachable";
     return nullptr;
   }
@@ -95,9 +113,9 @@ class HTTPUpstreamSessionController : public HTTPSessionController {
    * error contains specific information about what went wrong
    */
   HTTPTransactionHandler* getParseErrorHandler(
-    HTTPTransaction* txn,
-    const HTTPException& error,
-    const folly::SocketAddress& localAddress) override final {
+      HTTPTransaction* /*txn*/,
+      const HTTPException& /*error*/,
+      const folly::SocketAddress& /*localAddress*/) final {
     LOG(FATAL) << "Unreachable";
     return nullptr;
   }
@@ -106,8 +124,8 @@ class HTTPUpstreamSessionController : public HTTPSessionController {
    * Will be invoked when HTTPSession times out parsing a new request.
    */
   HTTPTransactionHandler* getTransactionTimeoutHandler(
-    HTTPTransaction* txn,
-    const folly::SocketAddress& localAddress) override final {
+      HTTPTransaction* /*txn*/,
+      const folly::SocketAddress& /*localAddress*/) final {
     LOG(FATAL) << "Unreachable";
     return nullptr;
   }

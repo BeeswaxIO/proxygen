@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -13,6 +13,8 @@
 #include <chrono>
 #include <cinttypes>
 #include <string>
+
+#include <folly/portability/Time.h>
 
 #include <openssl/ossl_typ.h>
 

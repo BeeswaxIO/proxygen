@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -11,7 +11,7 @@
 
 #include <boost/thread.hpp>
 #include <folly/io/async/SSLContext.h>
-#include <folly/ThreadName.h>
+#include <folly/system/ThreadName.h>
 #include <proxygen/httpserver/HTTPServer.h>
 #include <proxygen/httpserver/ResponseBuilder.h>
 
@@ -31,7 +31,7 @@ class ScopedHandler : public RequestHandler {
     requestBody_.append(std::move(body));
   }
 
-  void onUpgrade(proxygen::UpgradeProtocol proto) noexcept override {}
+  void onUpgrade(proxygen::UpgradeProtocol) noexcept override {}
 
   void onEOM() noexcept override {
     try {
@@ -53,7 +53,7 @@ class ScopedHandler : public RequestHandler {
 
   void requestComplete() noexcept override { delete this; }
 
-  void onError(ProxygenError err) noexcept override { delete this; }
+  void onError(ProxygenError) noexcept override { delete this; }
  private:
   HandlerType* const handlerPtr_{nullptr};
 
@@ -67,7 +67,7 @@ class ScopedHandlerFactory : public RequestHandlerFactory {
   explicit ScopedHandlerFactory(HandlerType handler): handler_(handler) {
   }
 
-  void onServerStart(folly::EventBase* evb) noexcept override {
+  void onServerStart(folly::EventBase*) noexcept override {
   }
 
   void onServerStop() noexcept override {
@@ -97,6 +97,12 @@ class ScopedHTTPServer final {
     int port = 0,
     int numThreads = 4,
     std::unique_ptr<wangle::SSLContextConfig> sslCfg = nullptr);
+
+  /**
+   * Start a server listening with the requested IPConfig and server opts
+   */
+  static std::unique_ptr<ScopedHTTPServer> start(
+    HTTPServer::IPConfig cfg, HTTPServerOptions options);
 
   /**
    * Get the port the server is listening on. This is helpful if the port was
@@ -139,7 +145,7 @@ inline std::unique_ptr<ScopedHTTPServer> ScopedHTTPServer::start(
     std::unique_ptr<wangle::SSLContextConfig> sslCfg) {
 
   std::unique_ptr<RequestHandlerFactory> f =
-      folly::make_unique<ScopedHandlerFactory<HandlerType>>(handler);
+      std::make_unique<ScopedHandlerFactory<HandlerType>>(handler);
   return start(std::move(f), port, numThreads, std::move(sslCfg));
 }
 
@@ -163,14 +169,20 @@ ScopedHTTPServer::start<std::unique_ptr<RequestHandlerFactory>>(
     cfg.sslConfigs.push_back(*sslCfg);
   }
 
-  std::vector<HTTPServer::IPConfig> IPs = { cfg };
-
   HTTPServerOptions options;
   options.threads = numThreads;
-
   options.handlerFactories.push_back(std::move(f));
+  return start(std::move(cfg), std::move(options));
+}
 
-  auto server = folly::make_unique<HTTPServer>(std::move(options));
+inline std::unique_ptr<ScopedHTTPServer>
+ScopedHTTPServer::start(
+    HTTPServer::IPConfig cfg,
+    HTTPServerOptions options) {
+
+  std::vector<HTTPServer::IPConfig> IPs = { std::move(cfg) };
+
+  auto server = std::make_unique<HTTPServer>(std::move(options));
   server->bind(IPs);
 
   // Start the server

@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -9,7 +9,7 @@
  */
 #pragma once
 
-#include <gmock/gmock.h>
+#include <folly/portability/GMock.h>
 #include <proxygen/lib/http/session/ByteEventTracker.h>
 
 namespace proxygen {
@@ -25,6 +25,8 @@ class MockByteEventTracker : public ByteEventTracker {
   MOCK_METHOD0(drainByteEvents, size_t());
   MOCK_METHOD3(processByteEvents, bool(std::shared_ptr<ByteEventTracker>,
                                        uint64_t, bool));
+  GMOCK_METHOD2_(, noexcept,, addTrackedByteEvent,
+      void(HTTPTransaction*, uint64_t));
   GMOCK_METHOD3_(, noexcept,, addLastByteEvent,
       void(HTTPTransaction*, uint64_t, bool));
   MOCK_METHOD3(preSend, uint64_t(bool*, bool*, uint64_t));

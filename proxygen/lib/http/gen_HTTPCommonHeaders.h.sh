@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 if [ "x$1" != "x" ];then
 	export HEADERS_LIST="$1"
@@ -23,6 +23,7 @@ cat ${HEADERS_LIST?} | LC_ALL=C sort | uniq \
     for (i in n) {
       h = n[i];
       gsub("-", "_", h);
+			gsub(":", "COLON_", h);
       print "  HTTP_HEADER_" toupper(h) " = " i+1 ","
     };
     next

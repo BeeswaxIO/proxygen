@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -29,6 +29,7 @@ class HTTPCodecPrinter: public PassThroughHTTPCodecFilter {
   void onFrameHeader(uint32_t stream_id,
                      uint8_t flags,
                      uint32_t length,
+                     uint8_t type,
                      uint16_t version = 0) override;
 
   /*

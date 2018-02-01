@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -40,7 +40,9 @@ DEFINE_string(next_protos, "h2,h2-14,spdy/3.1,spdy/3,http/1.1",
     "Next protocol string for NPN/ALPN");
 DEFINE_string(plaintext_proto, "", "plaintext protocol");
 DEFINE_int32(recv_window, 65536, "Flow control receive window for h2/spdy");
+DEFINE_bool(h2c, true, "Attempt HTTP/1.1 -> HTTP/2 upgrade");
 DEFINE_string(headers, "", "List of N=V headers separated by ,");
+DEFINE_string(proxy, "", "HTTP proxy URL");
 
 int main(int argc, char* argv[]) {
   gflags::ParseCommandLineFlags(&argc, &argv, true);
@@ -49,6 +51,7 @@ int main(int argc, char* argv[]) {
 
   EventBase evb;
   URL url(FLAGS_url);
+  URL proxy(FLAGS_proxy);
 
   if (FLAGS_http_method != "GET" && FLAGS_http_method != "POST") {
     LOG(ERROR) << "http_method must be either GET or POST";
@@ -58,7 +61,8 @@ int main(int argc, char* argv[]) {
   HTTPMethod httpMethod = *stringToMethod(FLAGS_http_method);
   if (httpMethod == HTTPMethod::POST) {
     try {
-      File(FLAGS_input_filename);
+      File f(FLAGS_input_filename);
+      (void)f;
     } catch (const std::system_error& se) {
       LOG(ERROR) << "Couldn't open file for POST method";
       LOG(ERROR) << se.what();
@@ -68,10 +72,10 @@ int main(int argc, char* argv[]) {
 
   vector<StringPiece> headerList;
   HTTPHeaders headers;
-  folly::split("|", FLAGS_headers, headerList);
+  folly::split("=", FLAGS_headers, headerList);
   for (const auto& headerPair: headerList) {
     vector<StringPiece> nv;
-    folly::split(':', headerPair, nv);
+    folly::split(',', headerPair, nv);
     if (nv.size() > 0) {
       if (nv[0].empty()) {
         continue;
@@ -84,11 +88,21 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  CurlClient curlClient(&evb, httpMethod, url, headers,
-                        FLAGS_input_filename);
+  CurlClient curlClient(&evb,
+                        httpMethod,
+                        url,
+                        FLAGS_proxy.empty() ? nullptr : &proxy,
+                        headers,
+                        FLAGS_input_filename,
+                        FLAGS_h2c);
   curlClient.setFlowControlSettings(FLAGS_recv_window);
 
-  SocketAddress addr(url.getHost(), url.getPort(), true);
+  SocketAddress addr;
+  if (!FLAGS_proxy.empty()) {
+    addr = SocketAddress(proxy.getHost(), proxy.getPort(), true);
+  } else {
+    addr = SocketAddress(url.getHost(), url.getPort(), true);
+  }
   LOG(INFO) << "Trying to connect to " << addr;
 
   // Note: HHWheelTimer is a large object and should be created at most

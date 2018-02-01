@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -21,10 +21,17 @@ class CurlClient : public proxygen::HTTPConnector::Callback,
                    public proxygen::HTTPTransactionHandler {
 
  public:
-  CurlClient(folly::EventBase* evb, proxygen::HTTPMethod httpMethod,
-             const proxygen::URL& url, const proxygen::HTTPHeaders& headers,
-             const std::string& inputFilename);
-  ~CurlClient() override;
+  CurlClient(folly::EventBase* evb,
+             proxygen::HTTPMethod httpMethod,
+             const proxygen::URL& url,
+             const proxygen::URL* proxy,
+             const proxygen::HTTPHeaders& headers,
+             const std::string& inputFilename,
+             bool h2c = false,
+             unsigned short httpMajor = 1,
+             unsigned short httpMinor = 1);
+
+  virtual ~CurlClient() = default;
 
   // initial SSL related structures
   void initializeSsl(const std::string& certPath,
@@ -49,6 +56,8 @@ class CurlClient : public proxygen::HTTPConnector::Callback,
   void onEgressPaused() noexcept override;
   void onEgressResumed() noexcept override;
 
+  void sendRequest(proxygen::HTTPTransaction* txn);
+
   // Getters
   folly::SSLContextPtr getSSLContext() { return sslContext_; }
 
@@ -69,11 +78,15 @@ protected:
   folly::EventBase* evb_{nullptr};
   proxygen::HTTPMethod httpMethod_;
   proxygen::URL url_;
+  std::unique_ptr<proxygen::URL> proxy_;
   proxygen::HTTPMessage request_;
   const std::string inputFilename_;
   folly::SSLContextPtr sslContext_;
-  int32_t recvWindow_;
+  int32_t recvWindow_{0};
   bool loggingEnabled_{true};
+  bool h2c_{false};
+  unsigned short httpMajor_;
+  unsigned short httpMinor_;
 
   std::unique_ptr<proxygen::HTTPMessage> response_;
 };

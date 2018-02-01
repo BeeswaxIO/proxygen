@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -41,8 +41,10 @@ class HTTPMessage {
 
   HTTPMessage();
   ~HTTPMessage();
+  HTTPMessage(HTTPMessage&& message) noexcept;
   HTTPMessage(const HTTPMessage& message);
   HTTPMessage& operator=(const HTTPMessage& message);
+  HTTPMessage& operator=(HTTPMessage&& message);
 
   /**
    * Is this a chunked message? (fpreq, fpresp)
@@ -275,6 +277,16 @@ class HTTPMessage {
    * Returns true if this is a 1xx response.
    */
   bool is1xxResponse() const { return (getStatusCode() / 100) == 1; }
+
+  /**
+   * Returns true if this is a 4xx response.
+   */
+  bool is4xxResponse() const { return (getStatusCode() / 100) == 4; }
+
+  /**
+   * Returns true if this is a 5xx response.
+   */
+  bool is5xxResponse() const { return (getStatusCode() / 100) == 5; }
 
   /**
    * Formats the current time appropriately for a Date header
@@ -545,9 +557,10 @@ class HTTPMessage {
   }
 
   /**
-   * Get the time when the first byte of the message arrived
+   * Getter and setter for the time when the first byte of the message arrived
    */
   TimePoint getStartTime() const { return startTime_; }
+  void setStartTime(const TimePoint& startTime) { startTime_ = startTime; }
 
   /**
    * Check if a particular token value is present in a header that consists of
@@ -566,7 +579,7 @@ class HTTPMessage {
    * callers have to explicitly call unparseCookies() after modifying the
    * cookie headers.
    */
-  void unparseCookies();
+  void unparseCookies() const;
 
   /**
    * Get the default reason string for a status code.
@@ -641,6 +654,11 @@ class HTTPMessage {
 
   void parseQueryParams() const;
   void unparseQueryParams();
+
+  bool doHeaderTokenCheck(const HTTPHeaders& headers_,
+                          const HTTPHeaderCode headerCode,
+                          char const* token,
+                          bool caseSensitive) const;
 
   /**
    * Trims whitespace from the beggining and end of the StringPiece.

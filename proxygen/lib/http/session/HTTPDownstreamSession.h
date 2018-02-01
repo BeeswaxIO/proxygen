@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -33,7 +33,7 @@ class HTTPDownstreamSession final: public HTTPSession {
       HTTPSessionController* controller,
       std::unique_ptr<HTTPCodec> codec,
       const wangle::TransportInfo& tinfo,
-      InfoCallback* infoCallback = nullptr):
+      InfoCallback* infoCallback):
     HTTPSession(timeout, std::move(sock), localAddr, peerAddr,
                 CHECK_NOTNULL(controller), std::move(codec), tinfo,
                 infoCallback) {
@@ -49,7 +49,7 @@ class HTTPDownstreamSession final: public HTTPSession {
       HTTPSessionController* controller,
       std::unique_ptr<HTTPCodec> codec,
       const wangle::TransportInfo& tinfo,
-      InfoCallback* infoCallback = nullptr):
+      InfoCallback* infoCallback):
     HTTPDownstreamSession(WheelTimerInstance(timer), std::move(sock), localAddr,
         peerAddr,CHECK_NOTNULL(controller), std::move(codec), tinfo,
         infoCallback) {
@@ -64,13 +64,6 @@ class HTTPDownstreamSession final: public HTTPSession {
    * Called by onHeadersComplete().
    */
   void setupOnHeadersComplete(HTTPTransaction* txn, HTTPMessage* msg) override;
-
-  /**
-   * Called by processParseError() in the downstream case. This function ensures
-   * that a handler is set for the transaction.
-   */
-  HTTPTransaction::Handler* getParseErrorHandler(
-    HTTPTransaction* txn, const HTTPException& error) override;
 
   /**
    * Called by transactionTimeout() in the downstream case. This function
@@ -91,6 +84,43 @@ class HTTPDownstreamSession final: public HTTPSession {
     HTTPCodec::StreamID streamID, CodecProtocol protocol,
     const std::string& protocolString,
     HTTPMessage& msg) override;
+
+
+  // Upstream methods.  Can implement when servers support making request
+  bool isDetachable(bool) const override {
+    LOG(FATAL) << __func__ << " is an upstream interface";
+    return false;
+  }
+
+  void attachThreadLocals(folly::EventBase*,
+                          folly::SSLContextPtr,
+                          const WheelTimerInstance&,
+                          HTTPSessionStats*,
+                          FilterIteratorFn,
+                          HeaderCodec::Stats*,
+                          HTTPSessionController*) override {
+    LOG(FATAL) << __func__ << " is an upstream interface";
+  }
+
+  void detachThreadLocals(bool) override {
+    LOG(FATAL) << __func__ << " is an upstream interface";
+  }
+
+  HTTPTransaction* newTransaction(HTTPTransaction::Handler*) override {
+    LOG(FATAL) << __func__ << " is an upstream interface";
+    return nullptr;
+  }
+
+  bool isReusable() const override {
+    LOG(FATAL) << __func__ << " is an upstream interface";
+    return false;
+  }
+
+  bool isClosing() const override {
+    LOG(FATAL) << __func__ << " is an upstream interface";
+    return false;
+  }
+
 };
 
 } // proxygen

@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -73,7 +73,6 @@ std::unique_ptr<IOBuf> ZlibStreamDecompressor::decompress(const IOBuf* in) {
       }
     }
 
-    // The decompressor says we should have finished
     if (status_ == Z_STREAM_END) {
       // we convert this into a stream error
       status_ = Z_STREAM_ERROR;

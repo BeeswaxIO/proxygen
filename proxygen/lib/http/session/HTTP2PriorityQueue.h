@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -9,10 +9,10 @@
  */
 #pragma once
 
-#include <proxygen/lib/http/codec/HTTPCodec.h>
-#include <proxygen/lib/http/codec/HTTP2Framer.h>
 #include <folly/IntrusiveList.h>
 #include <folly/io/async/HHWheelTimer.h>
+#include <proxygen/lib/http/codec/HTTP2Framer.h>
+#include <proxygen/lib/http/codec/HTTPCodec.h>
 #include <proxygen/lib/utils/WheelTimerInstance.h>
 
 #include <list>
@@ -97,6 +97,10 @@ class HTTP2PriorityQueue : public HTTPCodec::PriorityQueue {
     return activeCount_;
   }
 
+  uint64_t numVirtualNodes() const {
+    return numVirtualNodes_;
+  }
+
   void iterate(const std::function<bool(HTTPCodec::StreamID,
                                         HTTPTransaction *, double)>& fn,
                const std::function<bool()>& stopFn, bool all) {
@@ -117,6 +121,14 @@ class HTTP2PriorityQueue : public HTTPCodec::PriorityQueue {
   static void setNodeLifetime(std::chrono::milliseconds lifetime) {
     kNodeLifetime_ = lifetime;
   }
+
+  /// Error handling code
+  // Rebuilds tree by making all non-root nodes direct children of the root and
+  // weight reset to the default 16
+  void rebuildTree();
+  uint32_t getRebuildCount() const { return rebuildCount_; }
+  bool isRebuilt() const { return rebuildCount_ > 0; }
+
 
  private:
   // Find the node in priority tree
@@ -156,7 +168,7 @@ class HTTP2PriorityQueue : public HTTPCodec::PriorityQueue {
     Node(HTTP2PriorityQueue& queue, Node* inParent, HTTPCodec::StreamID id,
          uint8_t weight, HTTPTransaction *txn);
 
-    ~Node();
+    ~Node() override;
 
     // Functor comparing id to node and vice-versa
     struct IdNodeEqual {
@@ -220,6 +232,10 @@ class HTTP2PriorityQueue : public HTTPCodec::PriorityQueue {
 
     void clearPendingEgress();
 
+    uint16_t getWeight() const {
+      return weight_;
+    }
+
     // Set a new weight for this node
     void updateWeight(uint8_t weight);
 
@@ -244,7 +260,7 @@ class HTTP2PriorityQueue : public HTTPCodec::PriorityQueue {
         return 1.0;
       }
 
-      return (double)weight_ / parent_->totalChildWeight_;
+      return static_cast<double>(weight_) / parent_->totalChildWeight_;
     }
 
     double getRelativeEnqueuedWeight() const {
@@ -252,7 +268,11 @@ class HTTP2PriorityQueue : public HTTPCodec::PriorityQueue {
         return 1.0;
       }
 
-      return (double)weight_ / parent_->totalEnqueuedWeight_;
+      if (parent_->totalEnqueuedWeight_ == 0) {
+        return 0.0;
+      }
+
+      return static_cast<double>(weight_) / parent_->totalEnqueuedWeight_;
     }
 
     /* Execute the given function on this node and all child nodes presently
@@ -292,7 +312,13 @@ class HTTP2PriorityQueue : public HTTPCodec::PriorityQueue {
 
     void convertVirtualNode(HTTPTransaction* txn);
 
-    uint64_t calculateDepth() const;
+    uint64_t calculateDepth(bool includeVirtual = true) const;
+
+    // Internal error recovery
+    void flattenSubtree();
+    void flattenSubtreeDFS(Node* subtreeRoot);
+    static void addChildToNewSubtreeRoot(std::unique_ptr<Node> child,
+                                         Node* subtreeRoot);
 
    private:
     Handle addChild(std::unique_ptr<Node> child);
@@ -335,6 +361,9 @@ class HTTP2PriorityQueue : public HTTPCodec::PriorityQueue {
     uint64_t totalChildWeight_{0};
     std::list<std::unique_ptr<Node>> children_;
     std::list<std::unique_ptr<Node>>::iterator self_;
+    // enqueuedChildren_ includes all children that are themselves enqueued_
+    // or have enqueued descendants. Therefore, enqueuedChildren_ may contain
+    // direct children that have enqueued_ == false
     folly::IntrusiveListHook enqueuedHook_;
     folly::IntrusiveList<Node, &Node::enqueuedHook_> enqueuedChildren_;
   };
@@ -342,6 +371,8 @@ class HTTP2PriorityQueue : public HTTPCodec::PriorityQueue {
   typename NodeMap::bucket_type nodeBuckets_[kNumBuckets];
   NodeMap nodes_;
   Node root_{*this, nullptr, 0, 1, nullptr};
+  uint32_t rebuildCount_{0};
+  static uint32_t kMaxRebuilds_;
   uint64_t activeCount_{0};
   uint32_t maxVirtualNodes_{50};
   uint32_t numVirtualNodes_{0};

@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -9,7 +9,7 @@
  */
 #include <proxygen/lib/http/HTTPMethod.h>
 
-#include <folly/Foreach.h>
+#include <folly/container/Foreach.h>
 #include <folly/Indestructible.h>
 #include <proxygen/lib/http/HTTPHeaders.h>
 #include <vector>

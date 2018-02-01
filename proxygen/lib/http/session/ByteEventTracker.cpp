@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -10,12 +10,8 @@
 #include <proxygen/lib/http/session/ByteEventTracker.h>
 
 #include <folly/io/async/DelayedDestruction.h>
-#include <proxygen/lib/http/session/HTTPSession.h>
-#include <proxygen/lib/http/session/HTTPSessionStats.h>
 #include <string>
 
-using folly::AsyncSocket;
-using folly::AsyncTransportWrapper;
 using std::string;
 using std::vector;
 
@@ -66,6 +62,9 @@ bool ByteEventTracker::processByteEvents(std::shared_ptr<ByteEventTracker> self,
       txn->onEgressBodyLastByte();
       addAckToLastByteEvent(txn, event, eorTrackingEnabled);
       advanceEOM = true;
+      break;
+    case ByteEvent::TRACKED_BYTE:
+      txn->onEgressTrackedByte();
       break;
     case ByteEvent::PING_REPLY_SENT:
       latency = event.getLatency();
@@ -121,6 +120,15 @@ void ByteEventTracker::addLastByteEvent(
   }
 }
 
+void ByteEventTracker::addTrackedByteEvent(
+    HTTPTransaction* txn,
+    uint64_t byteNo) noexcept {
+  VLOG(5) << " adding tracked byte event for " << byteNo;
+  TransactionByteEvent* event = new TransactionByteEvent(
+      byteNo, ByteEvent::TRACKED_BYTE, txn);
+  byteEvents_.push_back(*event);
+}
+
 void ByteEventTracker::addPingByteEvent(size_t pingSize,
                                         TimePoint timestamp,
                                         uint64_t bytesScheduled) {
@@ -150,8 +158,8 @@ void ByteEventTracker::addPingByteEvent(size_t pingSize,
   }
 }
 
-uint64_t ByteEventTracker::preSend(bool* cork,
-                                   bool* eom,
+uint64_t ByteEventTracker::preSend(bool* /*cork*/,
+                                   bool* /*eom*/,
                                    uint64_t bytesWritten) {
   if (nextLastByteEvent_) {
     uint64_t nextLastByteNo = nextLastByteEvent_->byteOffset_;

@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2016, Facebook, Inc.
+ *  Copyright (c) 2017, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -14,6 +14,7 @@
 #include <proxygen/lib/http/codec/compress/HPACKConstants.h>
 #include <proxygen/lib/http/codec/compress/HPACKContext.h>
 #include <proxygen/lib/http/codec/compress/HPACKEncodeBuffer.h>
+#include <proxygen/lib/http/codec/compress/HeaderIndexingStrategy.h>
 #include <proxygen/lib/http/codec/compress/HeaderTable.h>
 #include <vector>
 
@@ -22,13 +23,11 @@ namespace proxygen {
 class HPACKEncoder : public HPACKContext {
 
  public:
-  HPACKEncoder(HPACK::MessageType msgType,
-               bool huffman,
-               uint32_t tableSize=HPACK::kTableSize);
-
-  HPACKEncoder(const huffman::HuffTree& huffmanTree,
-               bool huffman,
-               uint32_t tableSize=HPACK::kTableSize);
+  explicit HPACKEncoder(bool huffman,
+                        uint32_t tableSize=HPACK::kTableSize,
+                        bool emitSequenceNumbers=false,
+                        bool useBaseIndex=false,
+                        bool autoCommit=true);
 
   /**
    * Size of a new IOBuf which is added to the chain
@@ -42,11 +41,47 @@ class HPACKEncoder : public HPACKContext {
    */
   virtual std::unique_ptr<folly::IOBuf> encode(
     const std::vector<HPACKHeader>& headers,
-    uint32_t headroom = 0);
+    uint32_t headroom = 0,
+    bool* eviction = nullptr);
 
   void setHeaderTableSize(uint32_t size) {
     table_.setCapacity(size);
     pendingContextUpdate_ = true;
+  }
+
+  uint32_t getTableSize() const {
+    return table_.capacity();
+  }
+
+  uint32_t getBytesStored() const {
+    return table_.bytes();
+  }
+
+  uint32_t getHeadersStored() const {
+    return table_.size();
+  }
+
+  void setCommitEpoch(uint16_t commitEpoch) {
+    if (commitEpoch > commitEpoch_) {
+      commitEpoch_ = commitEpoch;
+    }
+  }
+
+  void packetFlushed() {
+    bytesInPacket_ = 0;
+    packetEpoch_ = nextSequenceNumber_;
+    VLOG(5) << "bumped packetEpoch_ to " << packetEpoch_;
+  }
+
+  void setHeaderIndexingStrategy(const HeaderIndexingStrategy* indexingStrat) {
+    indexingStrat_ = indexingStrat;
+  }
+  const HeaderIndexingStrategy* getHeaderIndexingStrategy() const {
+    return indexingStrat_;
+  }
+
+  static void enableAutoFlush() {
+    sEnableAutoFlush_ = true;
   }
 
  protected:
@@ -55,31 +90,23 @@ class HPACKEncoder : public HPACKContext {
  private:
   virtual void encodeHeader(const HPACKHeader& header);
 
-  virtual void encodeAsLiteral(const HPACKHeader& header);
-
-  void addHeader(const HPACKHeader& header);
-
-  void encodeDelta(const std::vector<HPACKHeader>& headers);
-
-  /**
-   * Figures out in advance if the header is going to evict headers
-   * that are part of the reference set and it will encode them using
-   * double indexing technique: first one will remove the index from the
-   * refset and the second one will add it again to the refset, emitting it
-   */
-  void encodeEvictedReferences(const HPACKHeader& header);
-
-  /**
-   * Returns true if the given header will be added to the header table
-   */
-  bool willBeAdded(const HPACKHeader& header);
-
-  void clearReferenceSet();
+  virtual void encodeAsLiteral(const HPACKHeader& header, bool indexable);
 
   bool huffman_;
+
+  const HeaderIndexingStrategy* indexingStrat_;
  protected:
   HPACKEncodeBuffer buffer_;
+  uint16_t packetEpoch_{0};
+  uint16_t nextSequenceNumber_{0};
+  int32_t commitEpoch_{-1};
+  uint16_t bytesInPacket_{0};
   bool pendingContextUpdate_{false};
+  bool eviction_{false};
+  bool emitSequenceNumbers_{false};
+  bool autoCommit_{true};
+
+  static bool sEnableAutoFlush_;
 };
 
 }
